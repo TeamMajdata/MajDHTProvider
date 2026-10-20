@@ -139,6 +139,46 @@ namespace MajDHTProvider.Tests
             TestSupport.AssertBytes(tail, last.Value);
         }
 
+        /// <summary>Serves a file indexed from its exported leaves without having read it, and refuses leaves that do not cover the length.</summary>
+        /// <returns>Completion after the reads.</returns>
+        [Fact]
+        public async Task LeavesIndexAFileWithoutReadingIt()
+        {
+            var token = TestContext.Current.CancellationToken;
+            using var directory = new TestDirectory();
+            var path = directory.Combine("track.mp3");
+            var content = RandomNumberGenerator.GetBytes((BlockSize * 2) + 10);
+            await File.WriteAllBytesAsync(path, content, token);
+            byte[] leaves;
+            await using (var stream = new FileBlockStore(1024 * 1024).OpenIndexing(path, BlockSize))
+            {
+                Assert.Throws<InvalidOperationException>(() => stream.ExportLeaves());
+                await stream.CompleteAsync(token);
+                leaves = stream.ExportLeaves();
+            }
+            Assert.Equal(3 * LeafId.Length, leaves.Length);
+
+            var store = new FileBlockStore(1024 * 1024);
+            store.IndexLeaves(path, BlockSize, content.Length, leaves);
+
+            Assert.Equal(1, store.IndexedFileCount);
+            for (var offset = 0; offset < content.Length; offset += BlockSize)
+            {
+                var block = content.AsMemory(offset, Math.Min(BlockSize, content.Length - offset));
+                var stored = await store.GetAsync(FileBlockStore.ComputeLeafId(block.Span), token);
+                Assert.NotNull(stored);
+                TestSupport.AssertBytes(block, stored.Value);
+            }
+            var tooFew = leaves[..LeafId.Length];
+            Assert.Throws<ArgumentException>(() => store.IndexLeaves(path, BlockSize, content.Length, tooFew));
+            var empty = directory.Combine("empty");
+            await File.WriteAllBytesAsync(empty, [], token);
+            store.IndexLeaves(empty, BlockSize, 0, Convert.FromHexString(FileBlockStore.ComputeLeafId([])));
+            var emptyBlock = await store.GetAsync(FileBlockStore.ComputeLeafId([]), token);
+            Assert.NotNull(emptyBlock);
+            Assert.Equal(0, emptyBlock.Value.Length);
+        }
+
         /// <summary>Keeps serving a block shared by two files until the last file containing it is removed from the index.</summary>
         /// <returns>Completion after the reads.</returns>
         [Fact]
@@ -178,6 +218,46 @@ namespace MajDHTProvider.Tests
             var stored = await store.GetAsync(leafId, TestContext.Current.CancellationToken);
             Assert.NotNull(stored);
             TestSupport.AssertBytes(block, stored.Value);
+        }
+
+        /// <summary>Lets the node resume a publication from exported leaves while the store serves the blocks from the file.</summary>
+        /// <returns>Completion after the download.</returns>
+        [Fact]
+        public async Task NodeResumesPublicationsFromExportedLeaves()
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var path = directory.Combine("bg.jpg");
+            var content = RandomNumberGenerator.GetBytes((16384 * 2) + 5);
+            await File.WriteAllBytesAsync(path, content, token);
+            var store = new FileBlockStore(32768);
+            await using var publisher = new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide), contentStore: store);
+            await publisher.StartAsync(token);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, publisher)), token);
+            byte[] leaves;
+            FileDigest digest;
+            await using (var source = store.OpenIndexing(path, 16384))
+            {
+                digest = await source.CompleteAsync(token);
+                leaves = source.ExportLeaves();
+            }
+            Assert.True(store.Remove(path));
+
+            // A fresh store never read the file: it knows the blocks only from the leaves.
+            var resumed = new FileBlockStore(32768);
+            resumed.IndexLeaves(path, 16384, digest.Length, leaves);
+            await using var restarted = new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide), contentStore: resumed);
+            await restarted.StartAsync(token);
+            await reader.AddPeerAsync(TestSupport.EndpointOf(restarted), cancellationToken: token);
+            var record = await restarted.PublishAsync("songs/from-leaves", leaves, digest.FileHash, digest.Length, cancellationToken: token);
+
+            Assert.Equal(digest.FileHash, record.FileHash);
+            using var destination = new MemoryStream();
+            await reader.DownloadAsync(record.Key, destination, record.FileHash, token);
+            TestSupport.AssertBytes(content, destination.ToArray());
         }
 
         /// <summary>Serves a published file from disk with leaf identifiers that match the node's Merkle leaves.</summary>

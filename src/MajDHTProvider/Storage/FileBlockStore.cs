@@ -102,6 +102,41 @@ namespace MajDHTProvider.Storage
             return await stream.CompleteAsync(cancellationToken).ConfigureAwait(false);
         }
 
+        /// <summary>
+        /// Indexes a file from the leaf identifiers of its blocks without reading it, replacing any earlier index of the
+        /// path, so a file known to be unchanged is served again after a restart at no cost. A block whose content no longer
+        /// matches its identifier is refused when it is read.
+        /// </summary>
+        /// <param name="path">The file path.</param>
+        /// <param name="blockSize">The block size of the content geometry.</param>
+        /// <param name="length">The file length the leaves were computed for.</param>
+        /// <param name="leaves">The contiguous 32-byte leaf identifiers of every block in file order.</param>
+        /// <exception cref="ArgumentOutOfRangeException">The block size is not positive or the length is negative.</exception>
+        /// <exception cref="ArgumentException">The leaves are not whole identifiers or do not match the block count of the length.</exception>
+        public void IndexLeaves(string path, int blockSize, long length, ReadOnlySpan<byte> leaves)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockSize);
+            ArgumentOutOfRangeException.ThrowIfNegative(length);
+            var blockCount = Math.Max(1L, (length + blockSize - 1) / blockSize);
+            if (leaves.Length % LeafId.Length != 0 || leaves.Length / LeafId.Length != blockCount)
+            {
+                throw new ArgumentException("The leaves do not describe every block of the length.", nameof(leaves));
+            }
+            var fullPath = Path.GetFullPath(path);
+            var file = new IndexedFile(fullPath);
+            lock (_gate)
+            {
+                RemoveLocked(fullPath);
+                _files[fullPath] = file;
+                for (var index = 0; index < blockCount; index++)
+                {
+                    var offset = index * (long)blockSize;
+                    var blockLength = (int)Math.Min(blockSize, length - offset);
+                    AddBlockLocked(file, LeafId.FromDigest(leaves.Slice(index * LeafId.Length, LeafId.Length)), offset, blockLength);
+                }
+            }
+        }
+
         /// <summary>Stops serving blocks from a file.</summary>
         /// <param name="path">The file path.</param>
         /// <returns>Whether the file was indexed.</returns>
@@ -166,21 +201,31 @@ namespace MajDHTProvider.Storage
         {
             lock (_gate)
             {
-                if (!_files.TryGetValue(file.Path, out var current) || current != file)
+                if (_files.TryGetValue(file.Path, out var current) && current == file)
                 {
-                    return;
+                    AddBlockLocked(file, leafId, offset, length);
                 }
-                file.Leaves.Add(leafId);
-                var location = new BlockLocation(file, offset, length);
-                if (!_blocks.TryGetValue(leafId, out var entry))
-                {
-                    _blocks[leafId] = new BlockEntry(location, null);
-                    return;
-                }
-                var others = entry.Others ?? [];
-                others.Add(location);
-                _blocks[leafId] = entry with { Others = others };
             }
+        }
+
+        /// <summary>Indexes one block of an indexed file.</summary>
+        /// <param name="file">The index entry of the file.</param>
+        /// <param name="leafId">The leaf identifier of the block.</param>
+        /// <param name="offset">The byte offset of the block.</param>
+        /// <param name="length">The exact block length.</param>
+        /// <remarks>The caller must hold <see cref="_gate"/>.</remarks>
+        private void AddBlockLocked(IndexedFile file, LeafId leafId, long offset, int length)
+        {
+            file.Leaves.Add(leafId);
+            var location = new BlockLocation(file, offset, length);
+            if (!_blocks.TryGetValue(leafId, out var entry))
+            {
+                _blocks[leafId] = new BlockEntry(location, null);
+                return;
+            }
+            var others = entry.Others ?? [];
+            others.Add(location);
+            _blocks[leafId] = entry with { Others = others };
         }
 
         /// <summary>Computes the MajDHT v1 leaf identifier of a raw block.</summary>

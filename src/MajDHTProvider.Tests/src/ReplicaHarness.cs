@@ -36,27 +36,34 @@ namespace MajDHTProvider.Tests
         /// <summary>Gets the replica.</summary>
         public ChartReplica Replica { get; }
 
-        /// <summary>Starts a replica of a publisher that joins the network through a bootstrap node.</summary>
-        /// <param name="root">The replica chart root.</param>
+        /// <summary>Starts a replica of a publisher, joining the network through a bootstrap node when one is given.</summary>
+        /// <param name="root">The replica chart root; its data directory is <c>&lt;root&gt;/.majdht</c>.</param>
         /// <param name="publisherId">The trusted publisher fingerprint.</param>
-        /// <param name="bootstrap">The started bootstrap node.</param>
+        /// <param name="bootstrap">The started bootstrap node, or null to start without any peer.</param>
         /// <param name="cancellationToken">The test deadline.</param>
         /// <param name="parallelism">How many resources the replica and its node handle at once.</param>
         /// <returns>The started harness.</returns>
-        public static async Task<ReplicaHarness> StartAsync(string root, string publisherId, MajDHTNode bootstrap,
+        public static async Task<ReplicaHarness> StartAsync(string root, string publisherId, MajDHTNode? bootstrap,
             CancellationToken cancellationToken, int parallelism = 4)
         {
             var charts = new ChartDirectory(root);
             var store = new FileBlockStore(1024 * 1024);
-            var replica = new ChartReplica(charts, store, publisherId,
-                Path.Combine(root, ProviderOptions.DefaultDataDirectoryName, ProviderHost.StagingDirectoryName),
+            var dataDirectory = Path.Combine(root, ProviderOptions.DefaultDataDirectoryName);
+            var leaves = new LeafCache(Path.Combine(dataDirectory, LeafCache.DirectoryName), NullLogger.Instance);
+            var replica = new ChartReplica(charts, store, leaves, publisherId, Path.Combine(dataDirectory, ProviderHost.StagingDirectoryName),
                 TimeSpan.FromSeconds(8), TimeSpan.FromHours(1), parallelism, NullLogger.Instance);
-            var options = TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide, bootstrap);
+            var options = bootstrap == null
+                ? TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide)
+                : TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide, bootstrap);
             TestSupport.ApplyProviderLimits(options);
             ProviderOptions.ApplyParallelism(options, parallelism);
             var node = new MajDHTNode(options, contentStore: store, contentFallback: replica);
             replica.Attach(node);
-            await TestSupport.StartAsync(node, cancellationToken);
+            await node.StartAsync(cancellationToken);
+            if (bootstrap != null)
+            {
+                await node.BootstrapAsync(cancellationToken);
+            }
             return new ReplicaHarness(charts.RootPath, node, replica);
         }
 

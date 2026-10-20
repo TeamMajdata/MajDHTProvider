@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
@@ -14,12 +15,15 @@ namespace MajDHTProvider.Storage
     /// read, so one pass over the file both feeds the DHT node and makes every block servable from disk. A block is indexed
     /// the moment its last byte has been read, before the node asks the store to keep it, so the store recognizes the block
     /// as file-backed instead of copying it into memory. <see cref="CompleteAsync"/> reads whatever the consumer left unread
-    /// and returns the complete-file digest.
+    /// and returns the complete-file digest; <see cref="ExportLeaves"/> then hands out the leaves for persistence.
     /// </summary>
     internal sealed class IndexingFileStream : Stream
     {
         /// <summary>The domain separation byte that precedes every block in its leaf hash.</summary>
         private static readonly byte[] s_leafPrefix = [0];
+
+        /// <summary>The leaf identifiers of the indexed blocks, in file order.</summary>
+        private readonly List<LeafId> _leaves = [];
 
         /// <summary>The store that receives the indexed blocks.</summary>
         private readonly FileBlockStore _store;
@@ -102,6 +106,23 @@ namespace MajDHTProvider.Storage
                 }
             }
             return _digest!.Value;
+        }
+
+        /// <summary>Copies the leaf identifiers of every block, in file order, for persistence.</summary>
+        /// <returns>The contiguous 32-byte identifiers.</returns>
+        /// <exception cref="InvalidOperationException">The file has not been read to its end.</exception>
+        public byte[] ExportLeaves()
+        {
+            if (_digest == null)
+            {
+                throw new InvalidOperationException("The leaves are complete only after the file was read to its end.");
+            }
+            var leaves = new byte[_leaves.Count * LeafId.Length];
+            for (var index = 0; index < _leaves.Count; index++)
+            {
+                _leaves[index].WriteTo(leaves.AsSpan(index * LeafId.Length));
+            }
+            return leaves;
         }
 
         /// <inheritdoc />
@@ -217,7 +238,9 @@ namespace MajDHTProvider.Storage
         {
             Span<byte> digest = stackalloc byte[LeafId.Length];
             _blockHash.GetHashAndReset(digest);
-            _store.AddBlock(_file, LeafId.FromDigest(digest), _position - _blockFill, _blockFill);
+            var leafId = LeafId.FromDigest(digest);
+            _leaves.Add(leafId);
+            _store.AddBlock(_file, leafId, _position - _blockFill, _blockFill);
             _blockCount++;
             _blockFill = 0;
             _blockOpen = false;

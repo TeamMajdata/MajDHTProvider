@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork;
@@ -87,7 +88,7 @@ namespace MajDHTProvider.Tests
             Assert.Equal(0, publisher.Store.IndexedFileCount);
         }
 
-        /// <summary>Withdraws, at the next start, resources removed while the publisher was offline.</summary>
+        /// <summary>Withdraws, at the next start, resources removed while the publisher was offline, and keeps serving the others.</summary>
         /// <returns>Completion after the checks.</returns>
         [Fact]
         public async Task RestartWithdrawsResourcesRemovedWhileOffline()
@@ -116,8 +117,9 @@ namespace MajDHTProvider.Tests
             await second.Publisher.SynchronizeAllAsync(token);
 
             Assert.True((await reader.ResolveAsync(new DHTKey(identity.NodeId, removed.KeyName), token))!.IsWithdrawn);
-            var republished = (await reader.ResolveAsync(new DHTKey(identity.NodeId, kept.KeyName), token))!;
-            Assert.True(republished.Revision > firstRevision);
+            // The kept resource is resumed from its cached leaves under the revision it already had.
+            var resumed = (await reader.ResolveAsync(new DHTKey(identity.NodeId, kept.KeyName), token))!;
+            Assert.Equal(firstRevision, resumed.Revision);
             TestSupport.AssertBytes(keptBytes, await TestSupport.DownloadAsync(reader, identity.NodeId, kept, token));
         }
 
@@ -229,6 +231,103 @@ namespace MajDHTProvider.Tests
                 Assert.NotNull(record);
                 Assert.Equal(removedCharts.Contains(resource.ChartId), record.IsWithdrawn);
             }
+        }
+
+        /// <summary>
+        /// Resumes unchanged resources after a restart from their cached leaves without reading the files: a record with
+        /// more than half of its lifetime left keeps its revision, a file whose content changed under an identical stamp
+        /// is trusted as unchanged, and a file whose stamp changed is read and published again.
+        /// </summary>
+        /// <returns>Completion after the checks.</returns>
+        [Fact]
+        public async Task RestartResumesUnchangedResourcesFromCachedLeaves()
+        {
+            using var deadline = Deadline();
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var root = directory.Combine("root");
+            var identity = new DHTIdentity();
+            var chartId = Guid.NewGuid();
+            var kept = new ChartResource(chartId, ChartResourceKind.Maidata);
+            var tampered = new ChartResource(chartId, ChartResourceKind.Image);
+            var changed = new ChartResource(chartId, ChartResourceKind.Track);
+            var keptBytes = TestSupport.WriteResource(root, kept, 40000);
+            TestSupport.WriteResource(root, tampered, 20000);
+            TestSupport.WriteResource(root, changed, 30000);
+            var records = new Dictionary<ChartResource, DHTRecord>();
+            await using (var first = await PublisherHarness.StartAsync(directory, identity, TimeSpan.FromHours(1), token))
+            {
+                await using var firstReader = await TestSupport.StartAsync(
+                    new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, first.Node)), token);
+                await first.Publisher.SynchronizeAllAsync(token);
+                foreach (var resource in new[] { kept, tampered, changed })
+                {
+                    records[resource] = (await firstReader.ResolveAsync(new DHTKey(identity.NodeId, resource.KeyName), token))!;
+                }
+            }
+            // Same length and write time but other content: the stamp says unchanged, so the cached leaves are trusted.
+            var tamperedPath = TestSupport.ResourcePath(root, tampered);
+            var tamperedStamp = Storage.FileStamp.Read(tamperedPath);
+            await File.WriteAllBytesAsync(tamperedPath, RandomNumberGenerator.GetBytes(20000), token);
+            File.SetLastWriteTimeUtc(tamperedPath, tamperedStamp.LastWriteTimeUtc);
+            Assert.Equal(tamperedStamp, Storage.FileStamp.Read(tamperedPath));
+            var changedBytes = TestSupport.WriteResource(root, changed, 30001);
+
+            await using var second = await PublisherHarness.StartAsync(directory, identity, TimeSpan.FromHours(1), token);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, second.Node)), token);
+            await second.Publisher.SynchronizeAllAsync(token);
+
+            var keptAgain = (await reader.ResolveAsync(records[kept].Key, token))!;
+            Assert.Equal(records[kept].Revision, keptAgain.Revision);
+            TestSupport.AssertBytes(keptBytes, await TestSupport.DownloadAsync(reader, identity.NodeId, kept, token));
+            var tamperedAgain = (await reader.ResolveAsync(records[tampered].Key, token))!;
+            Assert.Equal(records[tampered].Revision, tamperedAgain.Revision);
+            Assert.Equal(records[tampered].FileHash, tamperedAgain.FileHash);
+            var changedAgain = (await reader.ResolveAsync(records[changed].Key, token))!;
+            Assert.True(changedAgain.Revision > records[changed].Revision);
+            Assert.NotEqual(records[changed].FileHash, changedAgain.FileHash);
+            TestSupport.AssertBytes(changedBytes, await TestSupport.DownloadAsync(reader, identity.NodeId, changed, token));
+            Assert.Equal(3, second.Store.IndexedFileCount);
+        }
+
+        /// <summary>Signs a fresh revision from the cached leaves, still without reading the file, once the cached record passed half of its lifetime.</summary>
+        /// <returns>Completion after the checks.</returns>
+        [Fact]
+        public async Task RestartRenewsExpiringResourcesFromCachedLeaves()
+        {
+            using var deadline = Deadline();
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var root = directory.Combine("root");
+            var identity = new DHTIdentity();
+            var resource = new ChartResource(Guid.NewGuid(), ChartResourceKind.Video);
+            TestSupport.WriteResource(root, resource, 50000);
+            var lifetime = TimeSpan.FromSeconds(4);
+            DHTRecord original;
+            await using (var first = await PublisherHarness.StartAsync(directory, identity, lifetime, token))
+            {
+                await using var firstReader = await TestSupport.StartAsync(
+                    new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, first.Node)), token);
+                await first.Publisher.SynchronizeAllAsync(token);
+                original = (await firstReader.ResolveAsync(new DHTKey(identity.NodeId, resource.KeyName), token))!;
+            }
+            var path = TestSupport.ResourcePath(root, resource);
+            var stamp = Storage.FileStamp.Read(path);
+            await File.WriteAllBytesAsync(path, RandomNumberGenerator.GetBytes(50000), token);
+            File.SetLastWriteTimeUtc(path, stamp.LastWriteTimeUtc);
+            await Task.Delay(lifetime / 2, token);
+
+            await using var second = await PublisherHarness.StartAsync(directory, identity, lifetime, token);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, second.Node)), token);
+            await second.Publisher.SynchronizeAllAsync(token);
+
+            var renewed = (await reader.ResolveAsync(original.Key, token))!;
+            Assert.True(renewed.Revision > original.Revision);
+            Assert.True(renewed.ExpiresAt > original.ExpiresAt);
+            Assert.Equal(original.FileHash, renewed.FileHash);
+            Assert.Equal(1, second.Store.IndexedFileCount);
         }
 
         /// <summary>Creates the per-test deadline.</summary>

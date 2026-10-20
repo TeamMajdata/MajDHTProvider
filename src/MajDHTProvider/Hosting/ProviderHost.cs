@@ -62,8 +62,9 @@ namespace MajDHTProvider.Hosting
             var store = new FileBlockStore(_options.BlockCacheCapacity);
             var nodeOptions = _options.CreateNodeOptions(_loggerFactory.CreateLogger(typeof(MajDHTNode).FullName!));
             var routingPath = Path.Combine(dataDirectory, RoutingTableFile.FileName);
+            var leaves = new LeafCache(Path.Combine(dataDirectory, LeafCache.DirectoryName), _loggerFactory.CreateLogger<LeafCache>());
             var replica = _options.Mode == ProviderMode.Replica
-                ? new ChartReplica(charts, store, _options.PublisherId!, Path.Combine(dataDirectory, StagingDirectoryName),
+                ? new ChartReplica(charts, store, leaves, _options.PublisherId!, Path.Combine(dataDirectory, StagingDirectoryName),
                     _options.PullWait, _options.RefreshInterval, _options.Parallelism, _loggerFactory.CreateLogger<ChartReplica>())
                 : null;
             try
@@ -77,7 +78,7 @@ namespace MajDHTProvider.Hosting
                     await JoinNetworkAsync(node, nodeOptions.BootstrapEndpoints.Count, routingPath, cancellationToken).ConfigureAwait(false);
                     IChartSynchronizer synchronizer = (IChartSynchronizer?)replica
                         ?? new ChartPublisher(node, charts, store, PublicationLedger.Load(Path.Combine(dataDirectory, PublicationLedger.FileName)),
-                            nodeOptions, _options.Parallelism, _loggerFactory.CreateLogger<ChartPublisher>());
+                            leaves, nodeOptions, _options.Parallelism, _loggerFactory.CreateLogger<ChartPublisher>());
                     await RunSynchronizationAsync(charts, synchronizer, cancellationToken).ConfigureAwait(false);
                 }
                 finally

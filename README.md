@@ -57,7 +57,8 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 `<data>/identity.key` 是节点身份种子（机密），请备份并妥善保管；Publisher 丢失它将无法再
 以同一发布者身份发布或撤销。`<data>/publications.json` 是 Publisher 的发布账本，
 `<data>/routing.bin` 是两种模式都会保存的路由表快照（只含节点 ID 与端点，丢失仅意味着下次
-启动只能依赖引导节点）。
+启动只能依赖引导节点）。`<data>/leaves/<GUID>/<后缀>.leaves` 缓存每个已发布或已提供资源的
+Merkle 叶子、签名记录与文件戳记，让重启时不必重读文件；丢失只意味着对应文件被重读一次。
 
 ## 设计要点
 
@@ -88,6 +89,10 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 - **路由表持久化**：启动时同时通过 `<data>/routing.bin` 中保存的联系人与 `--bootstrap` 加入网络，
   其中任一成功即可；加入后与退出时都会把当前路由表保存回该文件（空表不会覆盖旧快照），因此
   重启后即使引导节点不可用也能重新加入。
+- **重启不重读**：每个资源发布或提供后，其 Merkle 叶子、签名记录与文件戳记写入 `<data>/leaves`。
+  重启扫描时，戳记未变的文件直接用缓存的叶子建立块索引并向节点注册：Publisher 在记录剩余寿命
+  超过一半时原样导入（修订号不变），否则用叶子签发新修订号；Replica 直接按缓存的记录继续提供，
+  由下一次刷新核对撤销与更新。缓存被拒绝、过期或戳记不一致时回退到读取文件。
 
 ## MajDHTNetwork 扩展
 
@@ -104,6 +109,8 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 - `ExportRoutingTable()` / `RestoreRoutingTableAsync(snapshot)`：导出与恢复路由表，供 `routing.bin` 使用。
 - 索引清理节流：节点缓存或登记记录时原本每次都全量遍历所有记录、修订号、提供者声明与本地 Merkle
   树，发布 N 个文件是 O(N²)；现在每秒最多清理一次，配额看似用尽时才立即清理。
+- `PublishAsync(name, leaves, fileHash, length, revision)` 与 `ImportContentAsync(record, leaves)`：从
+  预先计算的 Merkle 叶子登记内容而不读取数据，供 `<data>/leaves` 缓存在重启时使用。
 
 ## 大规模谱面库
 
@@ -115,8 +122,8 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
   网络、3 个对端下 1 万个资源约 30 s；广域网下取决于往返延迟，可用 `--parallelism` 提高并发，
   但要注意对端节点的 `MaxConcurrentRequests` 承受能力。未变化的重扫只比较目录列表中的长度与
   修改时间，1 万个文件约 0.2 s。
-- 重启后节点内存中没有内容注册信息，所有文件都会被重新读取一次并重新发布；要做到重启不重读，
-  需要 MajDHTNetwork 提供从持久化的 Merkle 叶子注册内容的 API。
+- 重启时戳记未变的文件不再读取，只从 `<data>/leaves` 注册并向 DHT 宣告；每个资源的缓存约为
+  文件大小的 1/512（16 KiB 块下每块 32 字节）加一条签名记录。
 
 ## 测试
 
@@ -125,8 +132,9 @@ dotnet test src/MajDHTProvider.Tests/MajDHTProvider.Tests.csproj
 dotnet test modules/MajDHTNetwork/src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration Release
 ```
 
-Provider 测试覆盖布局与密钥映射（含扫描给出的戳记）、命令行解析、文件块存储（含单次读取索引流与
-共享块的移除）、账本、身份与路由表持久化、目录监控、
+Provider 测试覆盖布局与密钥映射（含扫描给出的戳记）、命令行解析、文件块存储（含单次读取索引流、
+从叶子建立索引与共享块的移除）、账本、身份、路由表与叶子缓存的持久化、重启后不重读文件的续发布
+与续提供、目录监控、
 Publisher/Replica 与真实回环 DHT 节点的集成（含数十个资源的并发发布、续签、撤销与采纳），以及
 Publisher 与 Replica 两个宿主的端到端流程（含通过保存的路由表重新加入网络）。
 

@@ -19,7 +19,8 @@ namespace MajDHTProvider.Publishing
     /// content changed, withdraws keys whose files or chart directories were removed, and renews publications before
     /// their signed lifetime ends. Synchronizations and renewals are serialized, so a directory event and a rescan never
     /// race; within one of them the resources are read, published, withdrawn or renewed several at a time, and the ledger
-    /// is saved once at the end instead of after every resource.
+    /// is saved once at the end instead of after every resource. The leaves and record of every published file are cached,
+    /// so a restart registers unchanged files from the cache instead of reading them again.
     /// </summary>
     internal sealed class ChartPublisher : IChartSynchronizer
     {
@@ -31,6 +32,8 @@ namespace MajDHTProvider.Publishing
         private readonly FileBlockStore _store;
         /// <summary>The persistent revisions of every signed key.</summary>
         private readonly PublicationLedger _ledger;
+        /// <summary>The persistent leaves, records and stamps of published files.</summary>
+        private readonly LeafCache _leaves;
         /// <summary>The block size the node signs publications with.</summary>
         private readonly int _blockSize;
         /// <summary>The signed lifetime of a publication.</summary>
@@ -52,11 +55,12 @@ namespace MajDHTProvider.Publishing
         /// <param name="charts">The chart layout being published.</param>
         /// <param name="store">The block store the node was created with.</param>
         /// <param name="ledger">The persistent revisions of every signed key.</param>
+        /// <param name="leaves">The persistent leaves, records and stamps of published files.</param>
         /// <param name="nodeOptions">The options the node was created with.</param>
         /// <param name="parallelism">How many resources are published, withdrawn or renewed at once, at least one.</param>
         /// <param name="logger">Receives publisher diagnostics.</param>
         /// <exception cref="ArgumentOutOfRangeException">The parallelism is not positive.</exception>
-        public ChartPublisher(MajDHTNode node, ChartDirectory charts, FileBlockStore store, PublicationLedger ledger,
+        public ChartPublisher(MajDHTNode node, ChartDirectory charts, FileBlockStore store, PublicationLedger ledger, LeafCache leaves,
             DHTNodeOptions nodeOptions, int parallelism, ILogger logger)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(parallelism, 1);
@@ -64,6 +68,7 @@ namespace MajDHTProvider.Publishing
             _charts = charts;
             _store = store;
             _ledger = ledger;
+            _leaves = leaves;
             _blockSize = nodeOptions.BlockSize;
             _recordLifetime = nodeOptions.RecordLifetime;
             _parallelism = parallelism;
@@ -249,6 +254,10 @@ namespace MajDHTProvider.Publishing
                 {
                     return;
                 }
+                if (existing == null && await TryResumeLockedAsync(file, cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
                 if (existing != null)
                 {
                     // The file changed on disk; hashing it first avoids a new revision when only its metadata changed.
@@ -261,15 +270,21 @@ namespace MajDHTProvider.Publishing
                 }
                 var revision = _ledger.NextRevision(keyName);
                 DHTRecord record;
+                byte[] leaves;
                 // One pass over the file both feeds the node and indexes the blocks the store serves from it.
                 await using (var source = _store.OpenIndexing(file.Path, _blockSize))
                 {
                     record = await _node.PublishAsync(keyName, source, revision, cancellationToken).ConfigureAwait(false);
                     await source.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                    leaves = source.ExportLeaves();
                 }
                 _ledger.RecordPublished(keyName, revision, record.FileHash);
                 var unchangedDuringPublish = TryReadStamp(file.Path) == file.Stamp;
-                if (!unchangedDuringPublish)
+                if (unchangedDuringPublish)
+                {
+                    _leaves.Save(file.Resource, new CachedContent(file.Resource.Kind, file.Stamp, _blockSize, record.Length, record.FileHash, record.ToBytes(), leaves));
+                }
+                else
                 {
                     _logger.LogWarning("{Key} changed while it was published; it is published again on the next change or rescan.", keyName);
                 }
@@ -286,6 +301,74 @@ namespace MajDHTProvider.Publishing
             {
                 _logger.LogError(exception, "Publishing {Key} from {Path} failed.", keyName, file.Path);
             }
+        }
+
+        /// <summary>
+        /// Registers a resource from the leaves, record and stamp cached when it was last published, without reading the
+        /// file: the cached record is imported as it is while it has more than half of its lifetime left, and a fresh
+        /// revision is signed from the leaves otherwise.
+        /// </summary>
+        /// <param name="file">The resource file, whose stamp must equal the cached stamp for the cache to be trusted.</param>
+        /// <param name="cancellationToken">Stops publishing.</param>
+        /// <returns>Whether the resource is published from its cache; false when there is no usable cache entry.</returns>
+        /// <exception cref="IOException">The node's quotas refused the content.</exception>
+        /// <exception cref="OperationCanceledException">Publishing was cancelled.</exception>
+        /// <remarks>The caller must hold <see cref="_sync"/>, and this process must not have published the resource yet.</remarks>
+        private async Task<bool> TryResumeLockedAsync(ChartFile file, CancellationToken cancellationToken)
+        {
+            var cached = _leaves.TryLoad(file.Resource);
+            if (cached == null || cached.Stamp != file.Stamp || cached.BlockSize != _blockSize)
+            {
+                return false;
+            }
+            var keyName = file.Resource.KeyName;
+            try
+            {
+                _store.IndexLeaves(file.Path, _blockSize, cached.Length, cached.Leaves);
+                var record = cached.TryParseRecord();
+                if (record != null && IsResumableLocked(record, keyName))
+                {
+                    await _node.ImportContentAsync(record, cached.Leaves, cancellationToken).ConfigureAwait(false);
+                    _ledger.RecordPublished(keyName, record.Revision, record.FileHash);
+                }
+                else
+                {
+                    var revision = _ledger.NextRevision(keyName);
+                    record = await _node.PublishAsync(keyName, cached.Leaves, cached.FileHash, cached.Length, revision, cancellationToken).ConfigureAwait(false);
+                    _ledger.RecordPublished(keyName, revision, record.FileHash);
+                    _leaves.Save(file.Resource, cached with { Record = record.ToBytes() });
+                }
+                _publications[keyName] = new Publication(file.Resource, record, file.Path, file.Stamp);
+                _logger.LogInformation("Resumed {Key} revision {Revision} from its cached leaves without reading {Path}.", keyName, record.Revision, file.Path);
+                return true;
+            }
+            catch (Exception exception) when (exception is ArgumentException or InvalidDataException)
+            {
+                _logger.LogWarning(exception, "The cached leaves of {Key} were rejected: {Reason} The file is read and published again.", keyName, exception.Message);
+                _store.Remove(file.Path);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a cached record can be imported as it is: it is this publisher's publication of the key, the
+        /// ledger knows no newer record, and it has more than half of its lifetime left.
+        /// </summary>
+        /// <param name="record">The cached record.</param>
+        /// <param name="keyName">The key name of the resource.</param>
+        /// <returns>Whether importing the record is preferable to signing a fresh revision.</returns>
+        /// <remarks>The caller must hold <see cref="_sync"/>.</remarks>
+        private bool IsResumableLocked(DHTRecord record, string keyName)
+        {
+            if (record.IsWithdrawn || record.Key.PublisherId != _node.NodeId || record.Key.Name != keyName)
+            {
+                return false;
+            }
+            if (_ledger.TryGet(keyName, out var entry) && (entry.Withdrawn || entry.Revision > record.Revision))
+            {
+                return false;
+            }
+            return record.ExpiresAt > DateTimeOffset.UtcNow + (_recordLifetime / 2);
         }
 
         /// <summary>Reads the current stamp of a file after it was published.</summary>
@@ -332,6 +415,10 @@ namespace MajDHTProvider.Publishing
                 {
                     _store.Remove(publication.Path);
                 }
+                if (ChartResource.TryParseKeyName(keyName, out var resource))
+                {
+                    _leaves.Remove(resource);
+                }
                 _logger.LogInformation("Withdrew {Key} revision {Revision}.", keyName, withdrawal.Revision);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
@@ -355,6 +442,7 @@ namespace MajDHTProvider.Publishing
                 var record = await _node.PublishAliasAsync(keyName, publication.Record, revision, cancellationToken).ConfigureAwait(false);
                 _ledger.RecordPublished(keyName, revision, record.FileHash);
                 _publications[keyName] = publication with { Record = record };
+                _leaves.UpdateRecord(publication.Resource, record);
                 _logger.LogDebug("Renewed {Key} with revision {Revision}.", keyName, revision);
                 return true;
             }

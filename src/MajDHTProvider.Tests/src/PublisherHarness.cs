@@ -58,8 +58,9 @@ namespace MajDHTProvider.Tests
             var node = new MajDHTNode(options, identity, store);
             await node.StartAsync(cancellationToken);
             var ledgerPath = directory.Combine("data", PublicationLedger.FileName);
+            var leaves = new LeafCache(directory.Combine("data", LeafCache.DirectoryName), NullLogger.Instance);
             var publisher = new ChartPublisher(node, new ChartDirectory(directory.Combine("root")), store,
-                PublicationLedger.Load(ledgerPath), options, parallelism, NullLogger.Instance);
+                PublicationLedger.Load(ledgerPath), leaves, options, parallelism, NullLogger.Instance);
             return new PublisherHarness(node, publisher, store, ledgerPath);
         }
 

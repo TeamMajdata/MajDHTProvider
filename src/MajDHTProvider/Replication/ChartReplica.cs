@@ -20,7 +20,8 @@ namespace MajDHTProvider.Replication
     /// origin through the DHT, stores it and serves it. Local files are deleted only after the publisher withdraws their
     /// key; a file removed or changed by hand is merely no longer served, and an outdated file is replaced by the current
     /// publication. Within one synchronization or refresh, the resources are resolved, verified and imported several at a
-    /// time.
+    /// time. The leaves and record of every served file are cached, so a restart serves unchanged files again from the
+    /// cache without a lookup or a read, and the next refresh checks their publications.
     /// </summary>
     internal sealed class ChartReplica : IChartSynchronizer, IDHTContentFallback, IAsyncDisposable
     {
@@ -28,6 +29,8 @@ namespace MajDHTProvider.Replication
         private readonly ChartDirectory _charts;
         /// <summary>The block store that serves local files.</summary>
         private readonly FileBlockStore _store;
+        /// <summary>The persistent leaves, records and stamps of served files.</summary>
+        private readonly LeafCache _leaves;
         /// <summary>The trusted publisher fingerprint.</summary>
         private readonly string _publisherId;
         /// <summary>The directory receiving downloads before they are moved into the chart directory.</summary>
@@ -59,6 +62,7 @@ namespace MajDHTProvider.Replication
         /// <summary>Creates a replica that is idle until a node is attached.</summary>
         /// <param name="charts">The chart layout being served.</param>
         /// <param name="store">The block store the node is created with.</param>
+        /// <param name="leaves">The persistent leaves, records and stamps of served files.</param>
         /// <param name="publisherId">The trusted publisher fingerprint.</param>
         /// <param name="stagingDirectory">The directory for downloads in progress, ideally on the chart root's volume.</param>
         /// <param name="pullWait">How long a peer request waits for a pull before the peer fails over.</param>
@@ -66,12 +70,13 @@ namespace MajDHTProvider.Replication
         /// <param name="parallelism">How many resources are resolved, verified and imported at once, at least one.</param>
         /// <param name="logger">Receives replica diagnostics.</param>
         /// <exception cref="ArgumentOutOfRangeException">The parallelism is not positive.</exception>
-        public ChartReplica(ChartDirectory charts, FileBlockStore store, string publisherId, string stagingDirectory,
+        public ChartReplica(ChartDirectory charts, FileBlockStore store, LeafCache leaves, string publisherId, string stagingDirectory,
             TimeSpan pullWait, TimeSpan refreshInterval, int parallelism, ILogger logger)
         {
             ArgumentOutOfRangeException.ThrowIfLessThan(parallelism, 1);
             _charts = charts;
             _store = store;
+            _leaves = leaves;
             _publisherId = publisherId;
             _stagingDirectory = Path.GetFullPath(stagingDirectory);
             _pullWait = pullWait;
@@ -322,6 +327,7 @@ namespace MajDHTProvider.Replication
                     await Node.ImportContentAsync(current, source, cancellationToken).ConfigureAwait(false);
                 }
                 SetServed(resource with { Record = current });
+                _leaves.UpdateRecord(resource.Resource, current);
                 _logger.LogDebug("Following renewal of {Key} to revision {Revision}.", keyName, current.Revision);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
@@ -400,10 +406,16 @@ namespace MajDHTProvider.Replication
             try
             {
                 var file = _charts.FindFile(resource);
-                if (file == null || !await TryImportLocalFileAsync(file.Value.Path, record, cancellationToken).ConfigureAwait(false))
+                if (file == null)
                 {
                     return false;
                 }
+                var leaves = await TryImportLocalFileAsync(file.Value.Path, record, cancellationToken).ConfigureAwait(false);
+                if (leaves == null)
+                {
+                    return false;
+                }
+                _leaves.Save(resource, new CachedContent(resource.Kind, file.Value.Stamp, record.BlockSize, record.Length, record.FileHash, record.ToBytes(), leaves));
                 SetServed(new ServedResource(resource, record, file.Value.Path, file.Value.Stamp));
                 _logger.LogInformation("Serving {Key} from the local file {Path}.", resource.KeyName, file.Value.Path);
                 return true;
@@ -421,18 +433,18 @@ namespace MajDHTProvider.Replication
         /// <param name="path">The local file.</param>
         /// <param name="record">The publication.</param>
         /// <param name="cancellationToken">Stops the import.</param>
-        /// <returns>Whether the content matched and is now registered with the node.</returns>
+        /// <returns>The leaves of the file when its content matched and is now registered with the node, or null when it differs.</returns>
         /// <exception cref="IOException">The file or the content store failed.</exception>
         /// <exception cref="InvalidDataException">The node rejected the publication itself.</exception>
         /// <exception cref="OperationCanceledException">The import was cancelled.</exception>
-        private async Task<bool> TryImportLocalFileAsync(string path, DHTRecord record, CancellationToken cancellationToken)
+        private async Task<byte[]?> TryImportLocalFileAsync(string path, DHTRecord record, CancellationToken cancellationToken)
         {
             await using var source = _store.OpenIndexing(path, record.BlockSize);
             try
             {
                 await Node.ImportContentAsync(record, source, cancellationToken).ConfigureAwait(false);
                 await source.CompleteAsync(cancellationToken).ConfigureAwait(false);
-                return true;
+                return source.ExportLeaves();
             }
             catch (InvalidDataException)
             {
@@ -443,6 +455,48 @@ namespace MajDHTProvider.Replication
                     throw;
                 }
                 _store.Remove(path);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Serves a resource file again from the leaves, record and stamp cached when it was last served, without a lookup
+        /// or a read; the next refresh checks whether the publication is still current.
+        /// </summary>
+        /// <param name="file">The resource file, whose stamp must equal the cached stamp for the cache to be trusted.</param>
+        /// <param name="cancellationToken">Stops the import.</param>
+        /// <returns>Whether the resource is served from its cache; false when there is no usable cache entry.</returns>
+        /// <exception cref="IOException">The node's quotas refused the content.</exception>
+        /// <exception cref="OperationCanceledException">The import was cancelled.</exception>
+        /// <remarks>The caller must hold <see cref="_sync"/>, and the resource must not be served yet.</remarks>
+        private async Task<bool> TryResumeLockedAsync(ChartFile file, CancellationToken cancellationToken)
+        {
+            var cached = _leaves.TryLoad(file.Resource);
+            if (cached == null || cached.Stamp != file.Stamp)
+            {
+                return false;
+            }
+            var keyName = file.Resource.KeyName;
+            var record = cached.TryParseRecord();
+            if (record == null || record.IsWithdrawn || record.Key.PublisherId != _publisherId || record.Key.Name != keyName
+                || record.BlockSize != cached.BlockSize || record.Length != cached.Length)
+            {
+                _logger.LogDebug("The cached record of {Key} expired or does not describe the file; the publication is resolved instead.", keyName);
+                return false;
+            }
+            try
+            {
+                _store.IndexLeaves(file.Path, cached.BlockSize, cached.Length, cached.Leaves);
+                await Node.ImportContentAsync(record, cached.Leaves, cancellationToken).ConfigureAwait(false);
+                SetServed(new ServedResource(file.Resource, record, file.Path, file.Stamp));
+                _logger.LogInformation("Resumed serving {Key} from its cached leaves without reading {Path}.", keyName, file.Path);
+                return true;
+            }
+            catch (Exception exception) when (exception is ArgumentException or InvalidDataException)
+            {
+                _logger.LogWarning(exception, "The cached leaves of {Key} were rejected: {Reason} The publication is resolved instead.", keyName, exception.Message);
+                _store.Remove(file.Path);
+                _leaves.Remove(file.Resource);
                 return false;
             }
         }
@@ -474,7 +528,13 @@ namespace MajDHTProvider.Replication
                     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                     File.Move(staging, target, true);
                     var stamp = FileStamp.Read(target);
-                    await _store.IndexFileAsync(target, record.BlockSize, cancellationToken).ConfigureAwait(false);
+                    byte[] leaves;
+                    await using (var indexing = _store.OpenIndexing(target, record.BlockSize))
+                    {
+                        await indexing.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                        leaves = indexing.ExportLeaves();
+                    }
+                    _leaves.Save(resource, new CachedContent(resource.Kind, stamp, record.BlockSize, record.Length, record.FileHash, record.ToBytes(), leaves));
                     SetServed(new ServedResource(resource, record, target, stamp));
                     _logger.LogInformation("Stored {Key} at {Path} and serving it.", resource.KeyName, target);
                 }
@@ -532,6 +592,10 @@ namespace MajDHTProvider.Replication
             var keyName = file.Resource.KeyName;
             try
             {
+                if (await TryResumeLockedAsync(file, cancellationToken).ConfigureAwait(false))
+                {
+                    return;
+                }
                 var record = await Node.ResolveAsync(CreateKey(file.Resource), cancellationToken).ConfigureAwait(false);
                 if (record == null)
                 {
@@ -543,12 +607,14 @@ namespace MajDHTProvider.Replication
                     DeleteWithdrawnLocked(file.Resource, file.Path);
                     return;
                 }
-                if (!await TryImportLocalFileAsync(file.Path, record, cancellationToken).ConfigureAwait(false))
+                var leaves = await TryImportLocalFileAsync(file.Path, record, cancellationToken).ConfigureAwait(false);
+                if (leaves == null)
                 {
                     _logger.LogInformation("{Path} differs from revision {Revision} of {Key}; pulling the current version.", file.Path, record.Revision, keyName);
                     _ = GetOrStartPull(file.Resource, record);
                     return;
                 }
+                _leaves.Save(file.Resource, new CachedContent(file.Resource.Kind, file.Stamp, record.BlockSize, record.Length, record.FileHash, record.ToBytes(), leaves));
                 SetServed(new ServedResource(file.Resource, record, file.Path, file.Stamp));
                 _logger.LogInformation("Serving {Key} from the local file {Path}.", keyName, file.Path);
             }
@@ -573,6 +639,7 @@ namespace MajDHTProvider.Replication
                 StopServingLocked(served, "the publisher withdrew it");
             }
             _store.Remove(path);
+            _leaves.Remove(resource);
             try
             {
                 File.Delete(path);
@@ -600,6 +667,7 @@ namespace MajDHTProvider.Replication
                 _served.Remove(served.Resource.KeyName);
             }
             _store.Remove(served.Path);
+            _leaves.Remove(served.Resource);
             var shared = false;
             foreach (var other in SnapshotServed())
             {

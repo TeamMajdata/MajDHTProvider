@@ -1,10 +1,13 @@
 using System;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork;
+using MajDHTProvider.Charts;
 using MajDHTProvider.Hosting;
 using MajDHTProvider.Publishing;
+using MajDHTProvider.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -90,6 +93,53 @@ namespace MajDHTProvider.Tests
             Assert.NotNull(snapshot);
             Assert.Equal(1, await second.RestoreRoutingTableAsync(snapshot, token));
             Assert.Contains(second.KnownPeers, peer => peer.NodeId == known.NodeId);
+        }
+
+        /// <summary>Round-trips a cached resource description, replaces its record, ignores invalid entries and removes entries.</summary>
+        [Fact]
+        public void LeafCacheRoundTripsEntries()
+        {
+            using var directory = new TestDirectory();
+            var cache = new LeafCache(directory.Combine("leaves"), NullLogger.Instance);
+            var resource = new ChartResource(Guid.NewGuid(), ChartResourceKind.Track);
+            Assert.Null(cache.TryLoad(resource));
+            var identity = new DHTIdentity();
+            var length = (16384 * 2) + 1;
+            var fileHash = new string('a', 64);
+            var root = new string('b', 64);
+            var record = DHTRecord.Create(identity, resource.KeyName, fileHash, root, length, 16384, 7, DateTimeOffset.UtcNow.AddHours(1));
+            var leaves = RandomNumberGenerator.GetBytes(LeafId.Length * 3);
+            var entry = new CachedContent(resource.Kind, new FileStamp(length, DateTime.UtcNow), 16384, length, fileHash, record.ToBytes(), leaves);
+
+            cache.Save(resource, entry);
+            var loaded = cache.TryLoad(resource);
+
+            Assert.NotNull(loaded);
+            Assert.Equal(entry.Kind, loaded.Kind);
+            Assert.Equal(entry.Stamp, loaded.Stamp);
+            Assert.Equal(entry.BlockSize, loaded.BlockSize);
+            Assert.Equal(entry.Length, loaded.Length);
+            Assert.Equal(entry.FileHash, loaded.FileHash);
+            Assert.Equal(3, loaded.BlockCount);
+            TestSupport.AssertBytes(leaves, loaded.Leaves);
+            var parsed = loaded.TryParseRecord();
+            Assert.NotNull(parsed);
+            Assert.Equal(7, parsed.Revision);
+
+            var renewed = DHTRecord.Create(identity, resource.KeyName, fileHash, root, length, 16384, 8, DateTimeOffset.UtcNow.AddHours(2));
+            cache.UpdateRecord(resource, renewed);
+            Assert.Equal(8, cache.TryLoad(resource)!.TryParseRecord()!.Revision);
+            var other = DHTRecord.Create(identity, resource.KeyName, new string('c', 64), root, length, 16384, 9, DateTimeOffset.UtcNow.AddHours(2));
+            cache.UpdateRecord(resource, other);
+            Assert.Equal(8, cache.TryLoad(resource)!.TryParseRecord()!.Revision);
+
+            var chartDirectory = directory.Combine("leaves", ChartResource.FormatChartId(resource.ChartId));
+            var path = Assert.Single(Directory.GetFiles(chartDirectory));
+            File.WriteAllBytes(path, [1, 2, 3]);
+            Assert.Null(cache.TryLoad(resource));
+            cache.Remove(resource);
+            Assert.False(Directory.Exists(chartDirectory));
+            cache.Remove(resource);
         }
 
         /// <summary>Rejects ledger files that are not ledgers.</summary>

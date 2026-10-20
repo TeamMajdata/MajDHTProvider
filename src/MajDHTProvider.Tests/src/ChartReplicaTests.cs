@@ -180,6 +180,57 @@ namespace MajDHTProvider.Tests
             }
         }
 
+        /// <summary>Serves cached files again after a restart without the origin, any lookup or any read, until the next refresh checks them.</summary>
+        /// <returns>Completion after the blocks were read from the restarted replica.</returns>
+        [Fact]
+        public async Task RestartServesCachedFilesWithoutTheOrigin()
+        {
+            using var deadline = Deadline();
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var publisherRoot = directory.Combine("root");
+            var replicaRoot = directory.Combine("replica");
+            var chartId = Guid.NewGuid();
+            var resources = new[]
+            {
+                new ChartResource(chartId, ChartResourceKind.Maidata),
+                new ChartResource(chartId, ChartResourceKind.Track),
+                new ChartResource(chartId, ChartResourceKind.Image)
+            };
+            var contents = new Dictionary<ChartResource, byte[]>();
+            foreach (var resource in resources)
+            {
+                contents[resource] = TestSupport.WriteResource(publisherRoot, resource, 20000 + contents.Count);
+                TestSupport.WriteResource(replicaRoot, resource, contents[resource]);
+            }
+            await using var publisher = await PublisherHarness.StartAsync(directory, new DHTIdentity(), TimeSpan.FromHours(1), token);
+            await publisher.Publisher.SynchronizeAllAsync(token);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, publisher.Node)), token);
+            var records = new Dictionary<ChartResource, DHTRecord>();
+            foreach (var resource in resources)
+            {
+                records[resource] = (await reader.ResolveAsync(new DHTKey(publisher.Node.NodeId, resource.KeyName), token))!;
+            }
+            await using (var first = await ReplicaHarness.StartAsync(replicaRoot, publisher.Node.NodeId, publisher.Node, token))
+            {
+                await first.Replica.SynchronizeAllAsync(token);
+                Assert.Equal(resources.Length, first.Replica.ServedCount);
+            }
+            // The origin is gone, so only the cache can bring the files back.
+            await publisher.DisposeAsync();
+
+            await using var second = await ReplicaHarness.StartAsync(replicaRoot, publisher.Node.NodeId, null, token);
+            await second.Replica.SynchronizeAllAsync(token);
+
+            Assert.Equal(resources.Length, second.Replica.ServedCount);
+            foreach (var resource in resources)
+            {
+                var block = await reader.ReadBlockAsync(records[resource], second.Node.LocalPeer, 1, cancellationToken: token);
+                TestSupport.AssertBytes(contents[resource].AsMemory(16384), block);
+            }
+        }
+
         /// <summary>Declines requests for other publishers and for keys outside the chart namespace.</summary>
         /// <returns>Completion after the refused requests.</returns>
         [Fact]
