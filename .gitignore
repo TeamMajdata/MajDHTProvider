@@ -1,0 +1,14 @@
+# Build results
+bin/
+obj/
+artifacts/
+TestResults/
+
+# IDE state
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Provider runtime data (identity seeds, publication ledgers, staging files)
+.majdht/

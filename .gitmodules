@@ -1,0 +1,3 @@
+[submodule "modules/MajDHTNetwork"]
+	path = modules/MajDHTNetwork
+	url = https://github.com/TeamMajdata/MajDHTNetwork.git
