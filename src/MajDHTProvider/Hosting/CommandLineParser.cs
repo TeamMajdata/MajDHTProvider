@@ -38,6 +38,7 @@ namespace MajDHTProvider.Hosting
               --work-bits <0-20>           Identity work required by the network (default: 12).
               --quiet-period <duration>    Wait after the last file event of a chart (default: 2s).
               --rescan-interval <duration> Interval of full directory rescans (default: 10m).
+              --parallelism <n>            Chart resources synchronized at once, 1-64 (default: 8).
               --max-records <n>            DHT records retained by the node, 1-65536 (default: 65536).
               --max-local-leaves <n>       Merkle leaves of served content, 1-16777216 (default: 4194304,
                                            64 GiB at 16 KiB blocks).
@@ -140,6 +141,9 @@ namespace MajDHTProvider.Hosting
                         break;
                     case "--rescan-interval":
                         options.RescanInterval = ParseDuration(name, value);
+                        break;
+                    case "--parallelism":
+                        options.Parallelism = ParseInteger(name, value, 1, 64);
                         break;
                     case "--max-records":
                         options.MaxRecords = ParseInteger(name, value, 1, 65536);

@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork;
 using MajDHTProvider.Charts;
+using MajDHTProvider.Hosting;
 using Xunit;
 
 #nullable enable
@@ -38,6 +39,15 @@ namespace MajDHTProvider.Tests
                 options.BootstrapEndpoints.Add(EndpointOf(node));
             }
             return options;
+        }
+
+        /// <summary>Gives node options the record and Merkle leaf quotas a provider process runs with by default.</summary>
+        /// <param name="options">The node options of a publisher or replica node.</param>
+        public static void ApplyProviderLimits(DHTNodeOptions options)
+        {
+            var defaults = new ProviderOptions();
+            options.MaxRecords = defaults.MaxRecords;
+            options.MaxLocalLeaves = defaults.MaxLocalLeaves;
         }
 
         /// <summary>Gets the loopback TCP endpoint of a started node.</summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,7 +19,8 @@ namespace MajDHTProvider.Replication
     /// a resource that is not served yet, the replica checks its local file first and otherwise pulls the file from the
     /// origin through the DHT, stores it and serves it. Local files are deleted only after the publisher withdraws their
     /// key; a file removed or changed by hand is merely no longer served, and an outdated file is replaced by the current
-    /// publication.
+    /// publication. Within one synchronization or refresh, the resources are resolved, verified and imported several at a
+    /// time.
     /// </summary>
     internal sealed class ChartReplica : IChartSynchronizer, IDHTContentFallback, IAsyncDisposable
     {
@@ -34,13 +36,18 @@ namespace MajDHTProvider.Replication
         private readonly TimeSpan _pullWait;
         /// <summary>The interval between withdrawal and update checks.</summary>
         private readonly TimeSpan _refreshInterval;
+        /// <summary>How many resources are resolved, verified and imported at once.</summary>
+        private readonly int _parallelism;
         /// <summary>Receives replica diagnostics.</summary>
         private readonly ILogger _logger;
         /// <summary>Serializes every change of the served resources and the local files.</summary>
         private readonly SemaphoreSlim _sync = new(1, 1);
-        /// <summary>The resources currently served, keyed by key name.</summary>
+        /// <summary>The resources currently served, keyed by key name; every access holds <see cref="_gate"/>.</summary>
         private readonly Dictionary<string, ServedResource> _served = new(StringComparer.Ordinal);
-        /// <summary>Protects <see cref="_pulls"/> and <see cref="_served"/> for readers that do not hold <see cref="_sync"/>.</summary>
+        /// <summary>
+        /// Protects <see cref="_pulls"/> and <see cref="_served"/>, which are read by peer requests that do not hold
+        /// <see cref="_sync"/> and updated by the resources of one synchronization at once.
+        /// </summary>
         private readonly Lock _gate = new();
         /// <summary>The pulls in progress, keyed by key name, so concurrent requests share one pull.</summary>
         private readonly Dictionary<string, Task<bool>> _pulls = new(StringComparer.Ordinal);
@@ -56,16 +63,20 @@ namespace MajDHTProvider.Replication
         /// <param name="stagingDirectory">The directory for downloads in progress, ideally on the chart root's volume.</param>
         /// <param name="pullWait">How long a peer request waits for a pull before the peer fails over.</param>
         /// <param name="refreshInterval">The interval between withdrawal and update checks.</param>
+        /// <param name="parallelism">How many resources are resolved, verified and imported at once, at least one.</param>
         /// <param name="logger">Receives replica diagnostics.</param>
+        /// <exception cref="ArgumentOutOfRangeException">The parallelism is not positive.</exception>
         public ChartReplica(ChartDirectory charts, FileBlockStore store, string publisherId, string stagingDirectory,
-            TimeSpan pullWait, TimeSpan refreshInterval, ILogger logger)
+            TimeSpan pullWait, TimeSpan refreshInterval, int parallelism, ILogger logger)
         {
+            ArgumentOutOfRangeException.ThrowIfLessThan(parallelism, 1);
             _charts = charts;
             _store = store;
             _publisherId = publisherId;
             _stagingDirectory = Path.GetFullPath(stagingDirectory);
             _pullWait = pullWait;
             _refreshInterval = refreshInterval;
+            _parallelism = parallelism;
             _logger = logger;
         }
 
@@ -134,11 +145,11 @@ namespace MajDHTProvider.Replication
             await _sync.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                var files = _charts.Scan();
                 var present = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var file in _charts.Scan())
+                foreach (var file in files)
                 {
                     present.Add(file.Resource.KeyName);
-                    await AdoptLockedAsync(file, cancellationToken).ConfigureAwait(false);
                 }
                 foreach (var served in SnapshotServed())
                 {
@@ -147,6 +158,7 @@ namespace MajDHTProvider.Replication
                         StopServingLocked(served, "its file was removed locally");
                     }
                 }
+                await AdoptLockedAsync(files, cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("Serving {Count} chart resources from {Root}.", ServedCount, _charts.RootPath);
             }
             finally
@@ -166,11 +178,11 @@ namespace MajDHTProvider.Replication
             await _sync.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                var files = _charts.ScanChart(chartId);
                 var present = new HashSet<ChartResourceKind>();
-                foreach (var file in _charts.ScanChart(chartId))
+                foreach (var file in files)
                 {
                     present.Add(file.Resource.Kind);
-                    await AdoptLockedAsync(file, cancellationToken).ConfigureAwait(false);
                 }
                 foreach (var served in SnapshotServed())
                 {
@@ -179,6 +191,7 @@ namespace MajDHTProvider.Replication
                         StopServingLocked(served, "its file was removed locally");
                     }
                 }
+                await AdoptLockedAsync(files, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
@@ -200,8 +213,8 @@ namespace MajDHTProvider.Replication
         }
 
         /// <summary>
-        /// Resolves every served resource: deletes withdrawn resources, follows renewals and pulls updated content, then
-        /// retries local files that could not be served before.
+        /// Resolves every served resource, several at a time: deletes withdrawn resources, follows renewals and pulls updated
+        /// content, then retries local files that could not be served before.
         /// </summary>
         /// <param name="cancellationToken">Stops refreshing.</param>
         /// <returns>Completion after every resource was checked.</returns>
@@ -218,23 +231,7 @@ namespace MajDHTProvider.Replication
             {
                 _sync.Release();
             }
-            foreach (var resource in served)
-            {
-                DHTRecord? current;
-                try
-                {
-                    current = await Node.ResolveAsync(CreateKey(resource.Resource), cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception exception) when (exception is not OperationCanceledException)
-                {
-                    _logger.LogWarning(exception, "Resolving {Key} failed; it is checked again at the next refresh.", resource.Resource.KeyName);
-                    continue;
-                }
-                if (current != null)
-                {
-                    await ApplyResolvedRecordAsync(resource, current, cancellationToken).ConfigureAwait(false);
-                }
-            }
+            await ChartSynchronization.ForEachAsync(served, _parallelism, RefreshResourceAsync, cancellationToken).ConfigureAwait(false);
             try
             {
                 await SynchronizeAllAsync(cancellationToken).ConfigureAwait(false);
@@ -264,6 +261,29 @@ namespace MajDHTProvider.Replication
             _lifetime.Dispose();
         }
 
+        /// <summary>Resolves the latest publication of one served resource and applies it.</summary>
+        /// <param name="resource">The served resource.</param>
+        /// <param name="cancellationToken">Stops the refresh.</param>
+        /// <returns>Completion after the resource was checked; a failed lookup is logged and checked again at the next refresh.</returns>
+        /// <exception cref="OperationCanceledException">The refresh was cancelled.</exception>
+        private async Task RefreshResourceAsync(ServedResource resource, CancellationToken cancellationToken)
+        {
+            DHTRecord? current;
+            try
+            {
+                current = await Node.ResolveAsync(CreateKey(resource.Resource), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                _logger.LogWarning(exception, "Resolving {Key} failed; it is checked again at the next refresh.", resource.Resource.KeyName);
+                return;
+            }
+            if (current != null)
+            {
+                await ApplyResolvedRecordAsync(resource, current, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         /// <summary>Applies the latest publication of a served resource found during a refresh.</summary>
         /// <param name="resource">The served resource as it was before the lookup.</param>
         /// <param name="current">The latest record of its key.</param>
@@ -276,7 +296,7 @@ namespace MajDHTProvider.Replication
             try
             {
                 var keyName = resource.Resource.KeyName;
-                if (!_served.TryGetValue(keyName, out var latest) || latest != resource || current.Revision <= resource.Record.Revision)
+                if (!TryGetServed(keyName, out var latest) || latest != resource || current.Revision <= resource.Record.Revision)
                 {
                     return;
                 }
@@ -379,28 +399,51 @@ namespace MajDHTProvider.Replication
             await _sync.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                var path = _charts.FindFile(resource);
-                if (path == null)
+                var file = _charts.FindFile(resource);
+                if (file == null || !await TryImportLocalFileAsync(file.Value.Path, record, cancellationToken).ConfigureAwait(false))
                 {
                     return false;
                 }
-                var stamp = FileStamp.Read(path);
-                var digest = await _store.IndexFileAsync(path, record.BlockSize, cancellationToken).ConfigureAwait(false);
-                if (digest.FileHash != record.FileHash)
-                {
-                    return false;
-                }
-                await using (var source = OpenRead(path))
-                {
-                    await Node.ImportContentAsync(record, source, cancellationToken).ConfigureAwait(false);
-                }
-                SetServed(new ServedResource(resource, record, path, stamp));
-                _logger.LogInformation("Serving {Key} from the local file {Path}.", resource.KeyName, path);
+                SetServed(new ServedResource(resource, record, file.Value.Path, file.Value.Stamp));
+                _logger.LogInformation("Serving {Key} from the local file {Path}.", resource.KeyName, file.Value.Path);
                 return true;
             }
             finally
             {
                 _sync.Release();
+            }
+        }
+
+        /// <summary>
+        /// Serves a local file under a publication when its content matches it, reading the file once to both verify it
+        /// with the node and index the blocks the store serves from it.
+        /// </summary>
+        /// <param name="path">The local file.</param>
+        /// <param name="record">The publication.</param>
+        /// <param name="cancellationToken">Stops the import.</param>
+        /// <returns>Whether the content matched and is now registered with the node.</returns>
+        /// <exception cref="IOException">The file or the content store failed.</exception>
+        /// <exception cref="InvalidDataException">The node rejected the publication itself.</exception>
+        /// <exception cref="OperationCanceledException">The import was cancelled.</exception>
+        private async Task<bool> TryImportLocalFileAsync(string path, DHTRecord record, CancellationToken cancellationToken)
+        {
+            await using var source = _store.OpenIndexing(path, record.BlockSize);
+            try
+            {
+                await Node.ImportContentAsync(record, source, cancellationToken).ConfigureAwait(false);
+                await source.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (InvalidDataException)
+            {
+                // The node rejects differing content only after reading it all; a matching digest means it rejected the record itself.
+                var digest = await source.CompleteAsync(cancellationToken).ConfigureAwait(false);
+                if (digest.FileHash == record.FileHash && digest.Length == record.Length)
+                {
+                    throw;
+                }
+                _store.Remove(path);
+                return false;
             }
         }
 
@@ -446,27 +489,49 @@ namespace MajDHTProvider.Replication
             }
         }
 
-        /// <summary>Serves a local resource file after checking it against the current publication.</summary>
-        /// <param name="file">The resource file.</param>
-        /// <param name="cancellationToken">Stops the check.</param>
-        /// <returns>Completion after the file was served, deleted, scheduled for replacement or left unserved.</returns>
-        /// <exception cref="OperationCanceledException">The check was cancelled.</exception>
+        /// <summary>
+        /// Serves local resource files after checking them against their current publications. Files that are served
+        /// unchanged are skipped; files that changed first stop being served, one after the other, and only then are the
+        /// remaining files resolved, verified and imported several at a time, so no content stops being provided while
+        /// another file with the same content is being imported.
+        /// </summary>
+        /// <param name="files">The resource files found on disk.</param>
+        /// <param name="cancellationToken">Stops the checks.</param>
+        /// <returns>Completion after every file was served, deleted, scheduled for replacement or left unserved.</returns>
+        /// <exception cref="OperationCanceledException">The checks were cancelled.</exception>
         /// <remarks>The caller must hold <see cref="_sync"/>. Failures are logged; the next change, rescan or refresh retries.</remarks>
-        private async Task AdoptLockedAsync(ChartFile file, CancellationToken cancellationToken)
+        private async Task AdoptLockedAsync(IReadOnlyList<ChartFile> files, CancellationToken cancellationToken)
         {
-            var keyName = file.Resource.KeyName;
-            try
+            var pending = new List<ChartFile>();
+            foreach (var file in files)
             {
-                var stamp = FileStamp.Read(file.Path);
-                _served.TryGetValue(keyName, out var existing);
-                if (existing != null && existing.Path == file.Path && existing.Stamp == stamp)
+                if (TryGetServed(file.Resource.KeyName, out var existing) && existing.Path == file.Path && existing.Stamp == file.Stamp)
                 {
-                    return;
+                    continue;
                 }
                 if (existing != null)
                 {
                     StopServingLocked(existing, "its file changed");
                 }
+                pending.Add(file);
+            }
+            await ChartSynchronization.ForEachAsync(pending, _parallelism, AdoptFileLockedAsync, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>Serves one local resource file that is not served yet after checking it against the current publication.</summary>
+        /// <param name="file">The resource file, with the stamp it had when it was found.</param>
+        /// <param name="cancellationToken">Stops the check.</param>
+        /// <returns>Completion after the file was served, deleted, scheduled for replacement or left unserved.</returns>
+        /// <exception cref="OperationCanceledException">The check was cancelled.</exception>
+        /// <remarks>
+        /// The caller must hold <see cref="_sync"/> and may run this for several different keys at once. Failures are logged;
+        /// the next change, rescan or refresh retries.
+        /// </remarks>
+        private async Task AdoptFileLockedAsync(ChartFile file, CancellationToken cancellationToken)
+        {
+            var keyName = file.Resource.KeyName;
+            try
+            {
                 var record = await Node.ResolveAsync(CreateKey(file.Resource), cancellationToken).ConfigureAwait(false);
                 if (record == null)
                 {
@@ -478,19 +543,13 @@ namespace MajDHTProvider.Replication
                     DeleteWithdrawnLocked(file.Resource, file.Path);
                     return;
                 }
-                var digest = await _store.IndexFileAsync(file.Path, record.BlockSize, cancellationToken).ConfigureAwait(false);
-                if (digest.FileHash != record.FileHash)
+                if (!await TryImportLocalFileAsync(file.Path, record, cancellationToken).ConfigureAwait(false))
                 {
-                    _store.Remove(file.Path);
                     _logger.LogInformation("{Path} differs from revision {Revision} of {Key}; pulling the current version.", file.Path, record.Revision, keyName);
                     _ = GetOrStartPull(file.Resource, record);
                     return;
                 }
-                await using (var source = OpenRead(file.Path))
-                {
-                    await Node.ImportContentAsync(record, source, cancellationToken).ConfigureAwait(false);
-                }
-                SetServed(new ServedResource(file.Resource, record, file.Path, stamp));
+                SetServed(new ServedResource(file.Resource, record, file.Path, file.Stamp));
                 _logger.LogInformation("Serving {Key} from the local file {Path}.", keyName, file.Path);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
@@ -509,7 +568,7 @@ namespace MajDHTProvider.Replication
         /// <remarks>The caller must hold <see cref="_sync"/>.</remarks>
         private void DeleteWithdrawnLocked(ChartResource resource, string path)
         {
-            if (_served.TryGetValue(resource.KeyName, out var served))
+            if (TryGetServed(resource.KeyName, out var served))
             {
                 StopServingLocked(served, "the publisher withdrew it");
             }
@@ -560,6 +619,18 @@ namespace MajDHTProvider.Replication
             lock (_gate)
             {
                 _served[served.Resource.KeyName] = served;
+            }
+        }
+
+        /// <summary>Gets the served resource of a key.</summary>
+        /// <param name="keyName">The key name.</param>
+        /// <param name="served">Receives the served resource when the key is served.</param>
+        /// <returns>Whether the key is served.</returns>
+        private bool TryGetServed(string keyName, [MaybeNullWhen(false)] out ServedResource served)
+        {
+            lock (_gate)
+            {
+                return _served.TryGetValue(keyName, out served);
             }
         }
 

@@ -89,8 +89,11 @@ namespace MajDHTProvider.Tests
             Assert.Contains(files, file => file.Resource == new ChartResource(s_chartId, ChartResourceKind.Maidata));
             Assert.Contains(files, file => file.Resource == new ChartResource(s_chartId, ChartResourceKind.Video));
             Assert.Contains(files, file => file.Resource == new ChartResource(second, ChartResourceKind.Track));
-            Assert.Equal(Path.Combine(upperDirectory, "track.mp3"), charts.FindFile(new ChartResource(second, ChartResourceKind.Track)),
-                ignoreCase: OperatingSystem.IsWindows());
+            var track = charts.FindFile(new ChartResource(second, ChartResourceKind.Track));
+            Assert.NotNull(track);
+            Assert.Equal(Path.Combine(upperDirectory, "track.mp3"), track.Value.Path, ignoreCase: OperatingSystem.IsWindows());
+            // The stamp a scan reports must be the one a metadata query reports, so unchanged files are recognized without one.
+            Assert.Equal(MajDHTProvider.Storage.FileStamp.Read(track.Value.Path), track.Value.Stamp);
             Assert.Null(charts.FindFile(new ChartResource(s_chartId, ChartResourceKind.Image)));
             Assert.Empty(charts.ScanChart(Guid.NewGuid()));
         }

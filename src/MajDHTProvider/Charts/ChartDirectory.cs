@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using MajDHTProvider.Storage;
 
 #nullable enable
 
@@ -8,7 +9,9 @@ namespace MajDHTProvider.Charts
 {
     /// <summary>
     /// Reads the chart storage layout <c>&lt;root&gt;/&lt;GUID&gt;/&lt;file&gt;</c>. Only directories named by a hyphenated GUID
-    /// and the five exact, case-sensitive resource file names belong to the layout; everything else is ignored.
+    /// and the five exact, case-sensitive resource file names belong to the layout; everything else is ignored. A scan takes
+    /// each file's length and last write time from the directory listing itself, so a library of many charts is scanned
+    /// without a metadata query per file.
     /// </summary>
     internal sealed class ChartDirectory
     {
@@ -58,15 +61,15 @@ namespace MajDHTProvider.Charts
 
         /// <summary>Finds the file that currently stores a resource.</summary>
         /// <param name="resource">The resource.</param>
-        /// <returns>The full path, or null when the resource file does not exist.</returns>
+        /// <returns>The file, or null when the resource file does not exist.</returns>
         /// <exception cref="IOException">The chart directory cannot be enumerated.</exception>
-        public string? FindFile(ChartResource resource)
+        public ChartFile? FindFile(ChartResource resource)
         {
             foreach (var file in ScanChart(resource.ChartId))
             {
                 if (file.Resource == resource)
                 {
-                    return file.Path;
+                    return file;
                 }
             }
             return null;
@@ -123,7 +126,7 @@ namespace MajDHTProvider.Charts
             return ChartResource.TryParseChartId(firstSegment, out chartId);
         }
 
-        /// <summary>Adds the recognized resource files of one chart directory.</summary>
+        /// <summary>Adds the recognized resource files of one chart directory, with the stamps the directory listing reports.</summary>
         /// <param name="chartId">The chart identifier.</param>
         /// <param name="directory">The chart directory.</param>
         /// <param name="files">Receives the resource files.</param>
@@ -132,11 +135,19 @@ namespace MajDHTProvider.Charts
         {
             try
             {
-                foreach (var path in Directory.EnumerateFiles(directory))
+                foreach (var info in new DirectoryInfo(directory).EnumerateFiles())
                 {
-                    if (ChartResource.TryParseFileName(Path.GetFileName(path), out var kind))
+                    if (!ChartResource.TryParseFileName(info.Name, out var kind))
                     {
-                        files.Add(new ChartFile(new ChartResource(chartId, kind), path));
+                        continue;
+                    }
+                    try
+                    {
+                        files.Add(new ChartFile(new ChartResource(chartId, kind), info.FullName, new FileStamp(info.Length, info.LastWriteTimeUtc)));
+                    }
+                    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                    {
+                        // The file disappeared or became unreadable while it was listed; the next change or rescan finds it again.
                     }
                 }
             }

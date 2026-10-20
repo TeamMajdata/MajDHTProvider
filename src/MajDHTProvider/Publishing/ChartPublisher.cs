@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
@@ -16,7 +17,9 @@ namespace MajDHTProvider.Publishing
     /// <summary>
     /// Publisher mode: publishes every chart resource file under the publisher's key namespace, republishes files whose
     /// content changed, withdraws keys whose files or chart directories were removed, and renews publications before
-    /// their signed lifetime ends. All changes are serialized, so a directory event and a rescan never race.
+    /// their signed lifetime ends. Synchronizations and renewals are serialized, so a directory event and a rescan never
+    /// race; within one of them the resources are read, published, withdrawn or renewed several at a time, and the ledger
+    /// is saved once at the end instead of after every resource.
     /// </summary>
     internal sealed class ChartPublisher : IChartSynchronizer
     {
@@ -32,12 +35,17 @@ namespace MajDHTProvider.Publishing
         private readonly int _blockSize;
         /// <summary>The signed lifetime of a publication.</summary>
         private readonly TimeSpan _recordLifetime;
+        /// <summary>How many resources are published, withdrawn or renewed at once.</summary>
+        private readonly int _parallelism;
         /// <summary>Receives publisher diagnostics.</summary>
         private readonly ILogger _logger;
-        /// <summary>Serializes every change of the publications.</summary>
+        /// <summary>Serializes synchronizations and renewals.</summary>
         private readonly SemaphoreSlim _sync = new(1, 1);
-        /// <summary>The publications this process signed and serves, keyed by key name.</summary>
-        private readonly Dictionary<string, Publication> _publications = new(StringComparer.Ordinal);
+        /// <summary>
+        /// The publications this process signed and serves, keyed by key name. The resources of one synchronization update
+        /// different keys at once, which is why the dictionary is concurrent.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Publication> _publications = new(StringComparer.Ordinal);
 
         /// <summary>Creates a publisher.</summary>
         /// <param name="node">The started node that signs and serves publications.</param>
@@ -45,16 +53,20 @@ namespace MajDHTProvider.Publishing
         /// <param name="store">The block store the node was created with.</param>
         /// <param name="ledger">The persistent revisions of every signed key.</param>
         /// <param name="nodeOptions">The options the node was created with.</param>
+        /// <param name="parallelism">How many resources are published, withdrawn or renewed at once, at least one.</param>
         /// <param name="logger">Receives publisher diagnostics.</param>
+        /// <exception cref="ArgumentOutOfRangeException">The parallelism is not positive.</exception>
         public ChartPublisher(MajDHTNode node, ChartDirectory charts, FileBlockStore store, PublicationLedger ledger,
-            DHTNodeOptions nodeOptions, ILogger logger)
+            DHTNodeOptions nodeOptions, int parallelism, ILogger logger)
         {
+            ArgumentOutOfRangeException.ThrowIfLessThan(parallelism, 1);
             _node = node;
             _charts = charts;
             _store = store;
             _ledger = ledger;
             _blockSize = nodeOptions.BlockSize;
             _recordLifetime = nodeOptions.RecordLifetime;
+            _parallelism = parallelism;
             _logger = logger;
         }
 
@@ -68,25 +80,27 @@ namespace MajDHTProvider.Publishing
             await _sync.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                var files = _charts.Scan();
                 var present = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var file in _charts.Scan())
+                foreach (var file in files)
                 {
                     present.Add(file.Resource.KeyName);
-                    await PublishIfChangedLockedAsync(file, cancellationToken).ConfigureAwait(false);
                 }
-                var signed = new HashSet<string>(_ledger.PublishedKeyNames, StringComparer.Ordinal);
-                signed.UnionWith(_publications.Keys);
-                foreach (var keyName in signed)
+                await ChartSynchronization.ForEachAsync(files, _parallelism, PublishIfChangedLockedAsync, cancellationToken).ConfigureAwait(false);
+                var removed = new List<string>();
+                foreach (var keyName in GetSignedKeyNamesLocked())
                 {
                     if (!present.Contains(keyName))
                     {
-                        await WithdrawLockedAsync(keyName, cancellationToken).ConfigureAwait(false);
+                        removed.Add(keyName);
                     }
                 }
+                await ChartSynchronization.ForEachAsync(removed, _parallelism, WithdrawLockedAsync, cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("Publishing {Count} chart resources from {Root}.", _publications.Count, _charts.RootPath);
             }
             finally
             {
+                SaveLedgerLocked();
                 _sync.Release();
             }
         }
@@ -102,23 +116,27 @@ namespace MajDHTProvider.Publishing
             await _sync.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                var files = _charts.ScanChart(chartId);
                 var present = new HashSet<ChartResourceKind>();
-                foreach (var file in _charts.ScanChart(chartId))
+                foreach (var file in files)
                 {
                     present.Add(file.Resource.Kind);
-                    await PublishIfChangedLockedAsync(file, cancellationToken).ConfigureAwait(false);
                 }
+                await ChartSynchronization.ForEachAsync(files, _parallelism, PublishIfChangedLockedAsync, cancellationToken).ConfigureAwait(false);
+                var removed = new List<string>();
                 foreach (var kind in ChartResource.AllKinds)
                 {
                     var keyName = new ChartResource(chartId, kind).KeyName;
                     if (!present.Contains(kind) && IsPublishedLocked(keyName))
                     {
-                        await WithdrawLockedAsync(keyName, cancellationToken).ConfigureAwait(false);
+                        removed.Add(keyName);
                     }
                 }
+                await ChartSynchronization.ForEachAsync(removed, _parallelism, WithdrawLockedAsync, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
+                SaveLedgerLocked();
                 _sync.Release();
             }
         }
@@ -159,24 +177,34 @@ namespace MajDHTProvider.Publishing
                     }
                 }
                 var renewed = 0;
-                foreach (var publication in due)
+                await ChartSynchronization.ForEachAsync(due, _parallelism, async (publication, token) =>
                 {
-                    if (await RenewLockedAsync(publication, cancellationToken).ConfigureAwait(false))
+                    if (await RenewLockedAsync(publication, token).ConfigureAwait(false))
                     {
-                        renewed++;
+                        Interlocked.Increment(ref renewed);
                     }
-                }
+                }, cancellationToken).ConfigureAwait(false);
                 if (due.Count != 0)
                 {
-                    _ledger.Save();
                     _logger.LogInformation("Renewed {Renewed} of {Due} publications that reached half of their lifetime.", renewed, due.Count);
                 }
                 return renewed;
             }
             finally
             {
+                SaveLedgerLocked();
                 _sync.Release();
             }
+        }
+
+        /// <summary>Lists every key whose latest signed record, in the ledger or in this process, is a publication.</summary>
+        /// <returns>The published key names.</returns>
+        /// <remarks>The caller must hold <see cref="_sync"/>.</remarks>
+        private HashSet<string> GetSignedKeyNamesLocked()
+        {
+            var signed = new HashSet<string>(_ledger.PublishedKeyNames, StringComparer.Ordinal);
+            signed.UnionWith(_publications.Keys);
+            return signed;
         }
 
         /// <summary>Checks whether the latest signed record of a key is a publication.</summary>
@@ -188,53 +216,90 @@ namespace MajDHTProvider.Publishing
             return _publications.ContainsKey(keyName) || (_ledger.TryGet(keyName, out var entry) && !entry.Withdrawn);
         }
 
+        /// <summary>Saves the ledger when it changed; a failure is logged because the next synchronization saves it again.</summary>
+        /// <remarks>The caller must hold <see cref="_sync"/>.</remarks>
+        private void SaveLedgerLocked()
+        {
+            try
+            {
+                _ledger.Save();
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogError(exception, "Could not save the publication ledger; it is saved again after the next synchronization.");
+            }
+        }
+
         /// <summary>Publishes a resource file unless the same content is already published from it.</summary>
         /// <param name="file">The resource file.</param>
         /// <param name="cancellationToken">Stops publishing.</param>
         /// <returns>Completion after the resource was published or skipped.</returns>
         /// <exception cref="OperationCanceledException">Publishing was cancelled.</exception>
-        /// <remarks>The caller must hold <see cref="_sync"/>. Failures are logged; the next change or rescan retries.</remarks>
+        /// <remarks>
+        /// The caller must hold <see cref="_sync"/> and may run this for several different keys at once. Failures are logged;
+        /// the next change or rescan retries.
+        /// </remarks>
         private async Task PublishIfChangedLockedAsync(ChartFile file, CancellationToken cancellationToken)
         {
             var keyName = file.Resource.KeyName;
             try
             {
-                var stamp = FileStamp.Read(file.Path);
                 _publications.TryGetValue(keyName, out var existing);
-                if (existing != null && existing.Path == file.Path && existing.Stamp == stamp)
+                if (existing != null && existing.Path == file.Path && existing.Stamp == file.Stamp)
                 {
                     return;
                 }
-                var digest = await _store.IndexFileAsync(file.Path, _blockSize, cancellationToken).ConfigureAwait(false);
-                if (existing != null && existing.Record.FileHash == digest.FileHash)
+                if (existing != null)
                 {
-                    _publications[keyName] = existing with { Path = file.Path, Stamp = stamp };
-                    return;
+                    // The file changed on disk; hashing it first avoids a new revision when only its metadata changed.
+                    var digest = await _store.IndexFileAsync(file.Path, _blockSize, cancellationToken).ConfigureAwait(false);
+                    if (existing.Record.FileHash == digest.FileHash)
+                    {
+                        _publications[keyName] = existing with { Path = file.Path, Stamp = file.Stamp };
+                        return;
+                    }
                 }
                 var revision = _ledger.NextRevision(keyName);
                 DHTRecord record;
-                await using (var source = File.OpenRead(file.Path))
+                // One pass over the file both feeds the node and indexes the blocks the store serves from it.
+                await using (var source = _store.OpenIndexing(file.Path, _blockSize))
                 {
                     record = await _node.PublishAsync(keyName, source, revision, cancellationToken).ConfigureAwait(false);
+                    await source.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 }
-                var unchangedDuringPublish = record.FileHash == digest.FileHash;
+                _ledger.RecordPublished(keyName, revision, record.FileHash);
+                var unchangedDuringPublish = TryReadStamp(file.Path) == file.Stamp;
                 if (!unchangedDuringPublish)
                 {
                     _logger.LogWarning("{Key} changed while it was published; it is published again on the next change or rescan.", keyName);
                 }
-                _ledger.RecordPublished(keyName, revision, record.FileHash);
-                _ledger.Save();
-                // A default stamp never matches a real file, so content that changed during publishing is indexed again.
-                _publications[keyName] = new Publication(file.Resource, record, file.Path, unchangedDuringPublish ? stamp : default);
+                // A default stamp never matches a real file, so content that changed during publishing is read again.
+                _publications[keyName] = new Publication(file.Resource, record, file.Path, unchangedDuringPublish ? file.Stamp : default);
                 _logger.LogInformation("Published {Key} revision {Revision} ({Length} bytes).", keyName, revision, record.Length);
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
-                _logger.LogWarning(exception, "Could not read {Path} to publish {Key}; it is retried on the next change or rescan.", file.Path, keyName);
+                _logger.LogWarning(exception, "Publishing {Key} from {Path} failed: {Reason} It is retried on the next change or rescan.",
+                    keyName, file.Path, exception.Message);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
                 _logger.LogError(exception, "Publishing {Key} from {Path} failed.", keyName, file.Path);
+            }
+        }
+
+        /// <summary>Reads the current stamp of a file after it was published.</summary>
+        /// <param name="path">The file path.</param>
+        /// <returns>The stamp, or the default stamp when the file cannot be read any more, which matches no file.</returns>
+        private static FileStamp TryReadStamp(string path)
+        {
+            try
+            {
+                return FileStamp.Read(path);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                return default;
             }
         }
 
@@ -243,7 +308,10 @@ namespace MajDHTProvider.Publishing
         /// <param name="cancellationToken">Stops withdrawing.</param>
         /// <returns>Completion after the key was withdrawn.</returns>
         /// <exception cref="OperationCanceledException">Withdrawing was cancelled.</exception>
-        /// <remarks>The caller must hold <see cref="_sync"/>. Failures are logged; the next change or rescan retries.</remarks>
+        /// <remarks>
+        /// The caller must hold <see cref="_sync"/> and may run this for several different keys at once. Failures are logged;
+        /// the next change or rescan retries.
+        /// </remarks>
         private async Task WithdrawLockedAsync(string keyName, CancellationToken cancellationToken)
         {
             try
@@ -260,8 +328,7 @@ namespace MajDHTProvider.Publishing
                     withdrawal = await _node.UnpublishAsync(keyName, 0, cancellationToken).ConfigureAwait(false);
                 }
                 _ledger.RecordWithdrawn(keyName, withdrawal.Revision);
-                _ledger.Save();
-                if (_publications.Remove(keyName, out var publication))
+                if (_publications.TryRemove(keyName, out var publication))
                 {
                     _store.Remove(publication.Path);
                 }
@@ -278,7 +345,7 @@ namespace MajDHTProvider.Publishing
         /// <param name="cancellationToken">Stops renewing.</param>
         /// <returns>Whether the publication was renewed.</returns>
         /// <exception cref="OperationCanceledException">Renewal was cancelled.</exception>
-        /// <remarks>The caller must hold <see cref="_sync"/> and save the ledger.</remarks>
+        /// <remarks>The caller must hold <see cref="_sync"/>, may run this for several publications at once, and saves the ledger.</remarks>
         private async Task<bool> RenewLockedAsync(Publication publication, CancellationToken cancellationToken)
         {
             var keyName = publication.Resource.KeyName;
@@ -293,17 +360,44 @@ namespace MajDHTProvider.Publishing
             }
             catch (ArgumentException)
             {
-                _logger.LogInformation("{Key} is no longer registered locally; publishing it again from {Path}.", keyName, publication.Path);
-                // Forgetting the publication makes the next step read and sign the file again instead of reusing the record.
-                _publications.Remove(keyName);
-                await PublishIfChangedLockedAsync(new ChartFile(publication.Resource, publication.Path), cancellationToken).ConfigureAwait(false);
-                return _publications.TryGetValue(keyName, out var republished) && republished.Record.Revision > publication.Record.Revision;
+                return await RepublishLockedAsync(publication, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
                 _logger.LogError(exception, "Renewing {Key} failed; it is retried at the next renewal check.", keyName);
                 return false;
             }
+        }
+
+        /// <summary>Publishes a resource again from its file after the node forgot its content, for example because its record expired.</summary>
+        /// <param name="publication">The publication whose content is no longer registered.</param>
+        /// <param name="cancellationToken">Stops publishing.</param>
+        /// <returns>Whether the resource was published again under a higher revision.</returns>
+        /// <exception cref="OperationCanceledException">Publishing was cancelled.</exception>
+        /// <remarks>The caller must hold <see cref="_sync"/>.</remarks>
+        private async Task<bool> RepublishLockedAsync(Publication publication, CancellationToken cancellationToken)
+        {
+            var keyName = publication.Resource.KeyName;
+            _logger.LogInformation("{Key} is no longer registered locally; publishing it again from {Path}.", keyName, publication.Path);
+            // Forgetting the publication makes the next step read and sign the file again instead of reusing the record.
+            _publications.TryRemove(keyName, out _);
+            ChartFile? file;
+            try
+            {
+                file = _charts.FindFile(publication.Resource);
+            }
+            catch (IOException exception)
+            {
+                _logger.LogWarning(exception, "Could not look for the file of {Key}; it is retried on the next change or rescan.", keyName);
+                return false;
+            }
+            if (file == null)
+            {
+                _logger.LogInformation("{Key} has no file any more; it is withdrawn on the next rescan.", keyName);
+                return false;
+            }
+            await PublishIfChangedLockedAsync(file.Value, cancellationToken).ConfigureAwait(false);
+            return _publications.TryGetValue(keyName, out var republished) && republished.Record.Revision > publication.Record.Revision;
         }
 
         /// <summary>A publication this process signed and serves.</summary>

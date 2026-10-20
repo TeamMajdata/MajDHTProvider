@@ -100,6 +100,71 @@ namespace MajDHTProvider.Tests
             TestSupport.AssertBytes(content, stored.Value);
         }
 
+        /// <summary>
+        /// Indexes a file in the same pass that a consumer reads it: every block is servable from the file as soon as it was
+        /// read, a store of an indexed block is ignored, and finishing the pass indexes the trailing partial block.
+        /// </summary>
+        /// <returns>Completion after the reads.</returns>
+        [Fact]
+        public async Task IndexingStreamIndexesBlocksAsTheyAreRead()
+        {
+            var token = TestContext.Current.CancellationToken;
+            using var directory = new TestDirectory();
+            var path = directory.Combine("track.mp3");
+            var content = RandomNumberGenerator.GetBytes((BlockSize * 2) + 10);
+            await File.WriteAllBytesAsync(path, content, token);
+            var store = new FileBlockStore(1024 * 1024);
+            await using var stream = store.OpenIndexing(path, BlockSize);
+            var buffer = new byte[BlockSize];
+            Assert.Equal(BlockSize, await stream.ReadAtLeastAsync(buffer, BlockSize, false, token));
+            var firstLeaf = FileBlockStore.ComputeLeafId(buffer);
+            var stored = await store.GetAsync(firstLeaf, token);
+            Assert.NotNull(stored);
+            TestSupport.AssertBytes(content.AsMemory(0, BlockSize), stored.Value);
+            Assert.Equal(1, store.IndexedFileCount);
+
+            // A wrong copy offered for an indexed block is ignored, so the file keeps being the only source.
+            await store.PutAsync(firstLeaf, new byte[BlockSize], token);
+            stored = await store.GetAsync(firstLeaf, token);
+            Assert.NotNull(stored);
+            TestSupport.AssertBytes(content.AsMemory(0, BlockSize), stored.Value);
+
+            var digest = await stream.CompleteAsync(token);
+            Assert.Equal(Convert.ToHexStringLower(SHA256.HashData(content)), digest.FileHash);
+            Assert.Equal(content.Length, digest.Length);
+            Assert.Equal(digest, await stream.CompleteAsync(token));
+            var tail = content.AsMemory(BlockSize * 2);
+            var last = await store.GetAsync(FileBlockStore.ComputeLeafId(tail.Span), token);
+            Assert.NotNull(last);
+            TestSupport.AssertBytes(tail, last.Value);
+        }
+
+        /// <summary>Keeps serving a block shared by two files until the last file containing it is removed from the index.</summary>
+        /// <returns>Completion after the reads.</returns>
+        [Fact]
+        public async Task RemovingOneFileKeepsSharedBlocksOfAnother()
+        {
+            var token = TestContext.Current.CancellationToken;
+            using var directory = new TestDirectory();
+            var first = directory.Combine("first");
+            var second = directory.Combine("second");
+            var content = RandomNumberGenerator.GetBytes(BlockSize + 1);
+            await File.WriteAllBytesAsync(first, content, token);
+            await File.WriteAllBytesAsync(second, content, token);
+            var store = new FileBlockStore(1024 * 1024);
+            await store.IndexFileAsync(first, BlockSize, token);
+            await store.IndexFileAsync(second, BlockSize, token);
+            var leafId = FileBlockStore.ComputeLeafId(content.AsSpan(0, BlockSize));
+
+            Assert.True(store.Remove(first));
+            var stored = await store.GetAsync(leafId, token);
+            Assert.NotNull(stored);
+            TestSupport.AssertBytes(content.AsMemory(0, BlockSize), stored.Value);
+            Assert.True(store.Remove(second));
+            Assert.Null(await store.GetAsync(leafId, token));
+            Assert.Equal(0, store.IndexedFileCount);
+        }
+
         /// <summary>Caches blocks without a backing file and skips blocks already backed by one.</summary>
         /// <returns>Completion after the reads.</returns>
         [Fact]

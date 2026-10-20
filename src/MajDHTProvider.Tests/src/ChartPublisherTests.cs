@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -145,6 +147,88 @@ namespace MajDHTProvider.Tests
             Assert.True(renewed.ExpiresAt > original.ExpiresAt);
             Assert.Equal(original.FileHash, renewed.FileHash);
             TestSupport.AssertBytes(content, await TestSupport.DownloadAsync(reader, publisher.Node.NodeId, resource, token));
+        }
+
+        /// <summary>
+        /// Publishes, renews and withdraws many resources several at a time: every resource gets its own publication, an
+        /// unchanged rescan does not rewrite the ledger, every publication is renewed together at half-life, and the
+        /// resources of removed charts are withdrawn together.
+        /// </summary>
+        /// <returns>Completion after the checks.</returns>
+        [Fact]
+        public async Task ManyResourcesArePublishedRenewedAndWithdrawnTogether()
+        {
+            using var deadline = Deadline();
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var root = directory.Combine("root");
+            var chartIds = new List<Guid>();
+            var resources = new List<ChartResource>();
+            for (var chart = 0; chart < 12; chart++)
+            {
+                var chartId = Guid.NewGuid();
+                chartIds.Add(chartId);
+                foreach (var kind in ChartResource.AllKinds)
+                {
+                    var resource = new ChartResource(chartId, kind);
+                    resources.Add(resource);
+                    TestSupport.WriteResource(root, resource, 20000 + resources.Count);
+                }
+            }
+            var lifetime = TimeSpan.FromSeconds(8);
+            await using var publisher = await PublisherHarness.StartAsync(directory, new DHTIdentity(), lifetime, token, parallelism: 8);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, publisher.Node)), token);
+
+            var stopwatch = Stopwatch.StartNew();
+            await publisher.Publisher.SynchronizeAllAsync(token);
+            var published = DateTimeOffset.UtcNow;
+            TestContext.Current.TestOutputHelper?.WriteLine($"Published {resources.Count} resources in {stopwatch.Elapsed.TotalSeconds:F2}s.");
+
+            Assert.Equal(resources.Count, PublicationLedger.Load(publisher.LedgerPath).PublishedKeyNames.Count);
+            Assert.Equal(resources.Count, publisher.Store.IndexedFileCount);
+            var records = new List<DHTRecord>();
+            foreach (var resource in resources)
+            {
+                var record = await reader.ResolveAsync(new DHTKey(publisher.Node.NodeId, resource.KeyName), token);
+                Assert.NotNull(record);
+                records.Add(record);
+            }
+            var ledgerWritten = File.GetLastWriteTimeUtc(publisher.LedgerPath);
+            await publisher.Publisher.SynchronizeAllAsync(token);
+            Assert.Equal(ledgerWritten, File.GetLastWriteTimeUtc(publisher.LedgerPath));
+            Assert.Equal(0, await publisher.Publisher.RenewDueAsync(token));
+
+            // Every record was signed before the synchronization ended, so all reach half-life within half a lifetime of it.
+            var untilDue = published + (lifetime / 2) + TimeSpan.FromMilliseconds(200) - DateTimeOffset.UtcNow;
+            if (untilDue > TimeSpan.Zero)
+            {
+                await Task.Delay(untilDue, token);
+            }
+            Assert.Equal(resources.Count, await publisher.Publisher.RenewDueAsync(token));
+            for (var index = 0; index < resources.Count; index++)
+            {
+                var renewed = await reader.ResolveAsync(records[index].Key, token);
+                Assert.NotNull(renewed);
+                Assert.True(renewed.Revision > records[index].Revision);
+                Assert.Equal(records[index].FileHash, renewed.FileHash);
+            }
+
+            var removedCharts = chartIds.GetRange(0, 6);
+            foreach (var chartId in removedCharts)
+            {
+                Directory.Delete(Path.Combine(root, ChartResource.FormatChartId(chartId)), true);
+            }
+            await publisher.Publisher.SynchronizeAllAsync(token);
+            var remaining = resources.Count - (removedCharts.Count * ChartResource.AllKinds.Count);
+            Assert.Equal(remaining, PublicationLedger.Load(publisher.LedgerPath).PublishedKeyNames.Count);
+            Assert.Equal(remaining, publisher.Store.IndexedFileCount);
+            foreach (var resource in resources)
+            {
+                var record = await reader.ResolveAsync(new DHTKey(publisher.Node.NodeId, resource.KeyName), token);
+                Assert.NotNull(record);
+                Assert.Equal(removedCharts.Contains(resource.ChartId), record.IsWithdrawn);
+            }
         }
 
         /// <summary>Creates the per-test deadline.</summary>

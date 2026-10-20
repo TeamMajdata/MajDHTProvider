@@ -28,12 +28,28 @@ namespace MajDHTProvider.Tests
             Assert.Equal(ProviderOptions.DefaultPort, options.TcpPort);
             Assert.Equal(ProviderOptions.DefaultPort, options.UdpPort);
             Assert.Equal(TimeSpan.FromHours(24), options.RecordLifetime);
+            Assert.Equal(ProviderOptions.DefaultParallelism, options.Parallelism);
             Assert.Equal(LogLevel.Information, options.LogLevel);
             var node = options.CreateNodeOptions(NullLogger.Instance);
             Assert.Equal([IPAddress.Any], node.ListenAddresses);
             Assert.Equal(DHTCapabilities.Download | DHTCapabilities.Provide, node.Capabilities);
             Assert.Equal(12, node.IdentityWorkBits);
             Assert.Equal(4 * 1024 * 1024, node.MaxLocalLeaves);
+        }
+
+        /// <summary>Raises the node's request budget so every synchronized resource can replicate at once, and never lowers it.</summary>
+        [Fact]
+        public void ParallelismSizesTheRequestBudget()
+        {
+            var options = CommandLineParser.Parse(["publisher", "--root", "charts", "--parallelism", "16"])!;
+            Assert.Equal(16, options.Parallelism);
+            var node = options.CreateNodeOptions(NullLogger.Instance);
+            Assert.Equal(16 * 2 * node.DisjointLookupPaths * node.LookupParallelism, node.MaxConcurrentRequests);
+
+            var unchanged = new DHTNodeOptions();
+            var budget = unchanged.MaxConcurrentRequests;
+            ProviderOptions.ApplyParallelism(unchanged, 1);
+            Assert.Equal(budget, unchanged.MaxConcurrentRequests);
         }
 
         /// <summary>Parses every replica option, including repeated and inline values.</summary>
@@ -47,9 +63,10 @@ namespace MajDHTProvider.Tests
                 "--bootstrap", "198.51.100.1:42000", "--bootstrap=[2001:db8::1]:42001",
                 "--tcp-port", "0", "--udp-port", "none", "--relay", "--work-bits", "0",
                 "--quiet-period", "500ms", "--rescan-interval", "1h", "--refresh-interval", "00:05:00", "--pull-wait", "2s",
-                "--max-records", "100", "--max-local-leaves", "1000", "--cache-mb", "8", "--log-level", "debug"
+                "--parallelism", "2", "--max-records", "100", "--max-local-leaves", "1000", "--cache-mb", "8", "--log-level", "debug"
             ])!;
             Assert.Equal(ProviderMode.Replica, options.Mode);
+            Assert.Equal(2, options.Parallelism);
             Assert.Equal(PublisherId.ToLowerInvariant(), options.PublisherId);
             Assert.Equal(Path.GetFullPath("state"), options.GetDataDirectory());
             Assert.Equal(2, options.ListenAddresses.Count);
@@ -104,6 +121,8 @@ namespace MajDHTProvider.Tests
         [InlineData("publisher --root x --bootstrap 127.0.0.1")]
         [InlineData("publisher --root x --quiet-period soon")]
         [InlineData("publisher --root x --quiet-period 0s")]
+        [InlineData("publisher --root x --parallelism 0")]
+        [InlineData("publisher --root x --parallelism 65")]
         [InlineData("publisher --root x --record-lifetime 8d")]
         [InlineData("publisher --root x --log-level verbose")]
         [InlineData("publisher --root x --relay=yes")]

@@ -41,17 +41,20 @@ namespace MajDHTProvider.Tests
         /// <param name="publisherId">The trusted publisher fingerprint.</param>
         /// <param name="bootstrap">The started bootstrap node.</param>
         /// <param name="cancellationToken">The test deadline.</param>
+        /// <param name="parallelism">How many resources the replica and its node handle at once.</param>
         /// <returns>The started harness.</returns>
         public static async Task<ReplicaHarness> StartAsync(string root, string publisherId, MajDHTNode bootstrap,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken, int parallelism = 4)
         {
             var charts = new ChartDirectory(root);
             var store = new FileBlockStore(1024 * 1024);
             var replica = new ChartReplica(charts, store, publisherId,
                 Path.Combine(root, ProviderOptions.DefaultDataDirectoryName, ProviderHost.StagingDirectoryName),
-                TimeSpan.FromSeconds(8), TimeSpan.FromHours(1), NullLogger.Instance);
-            var node = new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide, bootstrap),
-                contentStore: store, contentFallback: replica);
+                TimeSpan.FromSeconds(8), TimeSpan.FromHours(1), parallelism, NullLogger.Instance);
+            var options = TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide, bootstrap);
+            TestSupport.ApplyProviderLimits(options);
+            ProviderOptions.ApplyParallelism(options, parallelism);
+            var node = new MajDHTNode(options, contentStore: store, contentFallback: replica);
             replica.Attach(node);
             await TestSupport.StartAsync(node, cancellationToken);
             return new ReplicaHarness(charts.RootPath, node, replica);

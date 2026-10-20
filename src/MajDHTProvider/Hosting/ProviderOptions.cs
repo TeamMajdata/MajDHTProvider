@@ -16,6 +16,8 @@ namespace MajDHTProvider.Hosting
         public const int DefaultPort = 42000;
         /// <summary>The name of the default data directory inside the chart root; it is not a chart directory.</summary>
         public const string DefaultDataDirectoryName = ".majdht";
+        /// <summary>The default number of chart resources synchronized at once.</summary>
+        public const int DefaultParallelism = 8;
 
         /// <summary>Gets or sets the provider mode.</summary>
         public ProviderMode Mode { get; set; }
@@ -68,6 +70,12 @@ namespace MajDHTProvider.Hosting
         /// <summary>Gets or sets the interval between full rescans that catch lost file notifications.</summary>
         public TimeSpan RescanInterval { get; set; } = TimeSpan.FromMinutes(10);
 
+        /// <summary>
+        /// Gets or sets how many chart resources are read, published, withdrawn, renewed or checked at once, which is also
+        /// how many publication replications the node admits at once.
+        /// </summary>
+        public int Parallelism { get; set; } = DefaultParallelism;
+
         /// <summary>Gets or sets the byte capacity of the memory cache for blocks not yet backed by a file.</summary>
         public long BlockCacheCapacity { get; set; } = 64L * 1024 * 1024;
 
@@ -89,7 +97,10 @@ namespace MajDHTProvider.Hosting
 
         /// <summary>Creates the DHT node configuration.</summary>
         /// <param name="logger">Receives DHT node diagnostics.</param>
-        /// <returns>Node options with download and provide capabilities, plus relay when enabled.</returns>
+        /// <returns>
+        /// Node options with download and provide capabilities, plus relay when enabled, whose request budget admits
+        /// <see cref="Parallelism"/> replications at once.
+        /// </returns>
         public DHTNodeOptions CreateNodeOptions(ILogger logger)
         {
             var capabilities = DHTCapabilities.Download | DHTCapabilities.Provide;
@@ -97,7 +108,7 @@ namespace MajDHTProvider.Hosting
             {
                 capabilities |= DHTCapabilities.Relay;
             }
-            return new DHTNodeOptions
+            var nodeOptions = new DHTNodeOptions
             {
                 ListenAddresses = ListenAddresses.Count == 0 ? [IPAddress.Any] : [.. ListenAddresses],
                 AdvertisedAddresses = [.. AdvertisedAddresses],
@@ -112,6 +123,24 @@ namespace MajDHTProvider.Hosting
                 MaxLocalLeaves = MaxLocalLeaves,
                 Logger = logger
             };
+            ApplyParallelism(nodeOptions, Parallelism);
+            return nodeOptions;
+        }
+
+        /// <summary>
+        /// Raises the request budget of node options until the node admits a number of publication replications at once.
+        /// A replication looks up the nodes near the key and near the file hash at the same time, each lookup runs every
+        /// disjoint path at full parallelism, and the node admits as many replications as fit into
+        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/>; the budget is never lowered.
+        /// </summary>
+        /// <param name="nodeOptions">The node options to adjust.</param>
+        /// <param name="parallelism">The replications the node must admit at once, at least one.</param>
+        /// <exception cref="ArgumentOutOfRangeException">The parallelism is not positive.</exception>
+        public static void ApplyParallelism(DHTNodeOptions nodeOptions, int parallelism)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(parallelism, 1);
+            var replicationFootprint = 2 * nodeOptions.DisjointLookupPaths * nodeOptions.LookupParallelism;
+            nodeOptions.MaxConcurrentRequests = Math.Max(nodeOptions.MaxConcurrentRequests, parallelism * replicationFootprint);
         }
     }
 }

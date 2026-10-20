@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -113,6 +115,69 @@ namespace MajDHTProvider.Tests
             Assert.False(File.Exists(TestSupport.ResourcePath(replicaRoot, maidata)));
             Assert.False(Directory.Exists(Path.Combine(replicaRoot, ChartResource.FormatChartId(chartId))));
             Assert.Equal(0, replica.Replica.ServedCount);
+        }
+
+        /// <summary>
+        /// Adopts many local files several at a time: matching files are served, outdated files are replaced by pulls, and a
+        /// refresh of every served resource keeps all of them.
+        /// </summary>
+        /// <returns>Completion after the checks.</returns>
+        [Fact]
+        public async Task ManyLocalFilesAreAdoptedTogether()
+        {
+            using var deadline = Deadline();
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var publisherRoot = directory.Combine("root");
+            var replicaRoot = directory.Combine("replica");
+            var resources = new List<ChartResource>();
+            var outdated = new List<ChartResource>();
+            for (var chart = 0; chart < 8; chart++)
+            {
+                var chartId = Guid.NewGuid();
+                foreach (var kind in ChartResource.AllKinds)
+                {
+                    var resource = new ChartResource(chartId, kind);
+                    resources.Add(resource);
+                    var content = TestSupport.WriteResource(publisherRoot, resource, 3000 + resources.Count);
+                    if (resources.Count % 5 == 0)
+                    {
+                        outdated.Add(resource);
+                        TestSupport.WriteResource(replicaRoot, resource, 1000);
+                    }
+                    else
+                    {
+                        TestSupport.WriteResource(replicaRoot, resource, content);
+                    }
+                }
+            }
+            await using var publisher = await PublisherHarness.StartAsync(directory, new DHTIdentity(), TimeSpan.FromHours(1), token, parallelism: 8);
+            await publisher.Publisher.SynchronizeAllAsync(token);
+            await using var replica = await ReplicaHarness.StartAsync(replicaRoot, publisher.Node.NodeId, publisher.Node, token, parallelism: 8);
+
+            var stopwatch = Stopwatch.StartNew();
+            await replica.Replica.SynchronizeAllAsync(token);
+            TestContext.Current.TestOutputHelper?.WriteLine($"Adopted {resources.Count} local files in {stopwatch.Elapsed.TotalSeconds:F2}s.");
+            await replica.Replica.WhenPullsCompleteAsync();
+
+            Assert.Equal(resources.Count, replica.Replica.ServedCount);
+            foreach (var resource in outdated)
+            {
+                TestSupport.AssertBytes(await File.ReadAllBytesAsync(TestSupport.ResourcePath(publisherRoot, resource), token),
+                    await File.ReadAllBytesAsync(TestSupport.ResourcePath(replicaRoot, resource), token));
+            }
+            await replica.Replica.RefreshAsync(token);
+            Assert.Equal(resources.Count, replica.Replica.ServedCount);
+            await using var reader = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, publisher.Node)), token);
+            foreach (var resource in new[] { resources[0], resources[^1], outdated[0] })
+            {
+                var record = await reader.ResolveAsync(new DHTKey(publisher.Node.NodeId, resource.KeyName), token);
+                Assert.NotNull(record);
+                Assert.True(publisher.Node.StopProviding(record.FileHash));
+                TestSupport.AssertBytes(await File.ReadAllBytesAsync(TestSupport.ResourcePath(publisherRoot, resource), token),
+                    await reader.ReadBlockAsync(record, replica.Node.LocalPeer, 0, cancellationToken: token));
+            }
         }
 
         /// <summary>Declines requests for other publishers and for keys outside the chart namespace.</summary>

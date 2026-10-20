@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork;
 using MajDHTProvider.Charts;
+using MajDHTProvider.Hosting;
 using MajDHTProvider.Publishing;
 using MajDHTProvider.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -44,18 +45,21 @@ namespace MajDHTProvider.Tests
         /// <param name="identity">The publisher identity.</param>
         /// <param name="recordLifetime">The publication lifetime.</param>
         /// <param name="cancellationToken">The test deadline.</param>
+        /// <param name="parallelism">How many resources the publisher and its node handle at once.</param>
         /// <returns>The started harness.</returns>
         public static async Task<PublisherHarness> StartAsync(TestDirectory directory, DHTIdentity identity, TimeSpan recordLifetime,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken, int parallelism = 4)
         {
             var store = new FileBlockStore(1024 * 1024);
             var options = TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide);
             options.RecordLifetime = recordLifetime;
+            TestSupport.ApplyProviderLimits(options);
+            ProviderOptions.ApplyParallelism(options, parallelism);
             var node = new MajDHTNode(options, identity, store);
             await node.StartAsync(cancellationToken);
             var ledgerPath = directory.Combine("data", PublicationLedger.FileName);
             var publisher = new ChartPublisher(node, new ChartDirectory(directory.Combine("root")), store,
-                PublicationLedger.Load(ledgerPath), options, NullLogger.Instance);
+                PublicationLedger.Load(ledgerPath), options, parallelism, NullLogger.Instance);
             return new PublisherHarness(node, publisher, store, ledgerPath);
         }
 

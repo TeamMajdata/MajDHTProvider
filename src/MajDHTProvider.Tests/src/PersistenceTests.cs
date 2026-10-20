@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using MajDHTNetwork;
 using MajDHTProvider.Hosting;
 using MajDHTProvider.Publishing;
@@ -38,6 +40,56 @@ namespace MajDHTProvider.Tests
             Assert.Equal(future + 1, reloaded.NextRevision("a"));
             Assert.True(reloaded.NextRevision("b") > first + 1);
             Assert.False(File.Exists(path + ".tmp"));
+        }
+
+        /// <summary>Writes the ledger file only after an entry changed, so saving after every synchronization is cheap.</summary>
+        [Fact]
+        public void LedgerIsSavedOnlyWhenChanged()
+        {
+            using var directory = new TestDirectory();
+            var path = directory.Combine("data", PublicationLedger.FileName);
+            var ledger = PublicationLedger.Load(path);
+            Assert.False(ledger.Save());
+            Assert.False(File.Exists(path));
+
+            ledger.RecordPublished("a", 1, "hash-a");
+            Assert.True(ledger.Save());
+            var written = File.GetLastWriteTimeUtc(path);
+            Assert.False(ledger.Save());
+            Assert.Equal(written, File.GetLastWriteTimeUtc(path));
+
+            ledger.RecordWithdrawn("a", 2);
+            Assert.True(ledger.Save());
+            Assert.True(PublicationLedger.Load(path).TryGet("a", out var entry));
+            Assert.True(entry.Withdrawn);
+        }
+
+        /// <summary>Rejoins the network from a saved routing table without any bootstrap endpoint.</summary>
+        /// <returns>Completion after the restored node found the saved contact.</returns>
+        [Fact]
+        public async Task RoutingTableFilesRejoinKnownNodes()
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var path = directory.Combine("data", RoutingTableFile.FileName);
+            Assert.Null(RoutingTableFile.TryLoad(path, NullLogger.Instance));
+            await using var known = new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download | DHTCapabilities.Provide));
+            await known.StartAsync(token);
+            await using var first = await TestSupport.StartAsync(
+                new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download, known)), token);
+
+            Assert.True(RoutingTableFile.Save(path, first.ExportRoutingTable(), NullLogger.Instance));
+            Assert.False(File.Exists(path + ".tmp"));
+
+            await using var second = new MajDHTNode(TestSupport.NodeOptions(DHTCapabilities.Download));
+            await second.StartAsync(token);
+            Assert.Empty(second.KnownPeers);
+            var snapshot = RoutingTableFile.TryLoad(path, NullLogger.Instance);
+            Assert.NotNull(snapshot);
+            Assert.Equal(1, await second.RestoreRoutingTableAsync(snapshot, token));
+            Assert.Contains(second.KnownPeers, peer => peer.NodeId == known.NodeId);
         }
 
         /// <summary>Rejects ledger files that are not ledgers.</summary>

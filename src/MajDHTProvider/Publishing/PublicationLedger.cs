@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
+using System.Threading;
 
 #nullable enable
 
@@ -9,7 +10,10 @@ namespace MajDHTProvider.Publishing
 {
     /// <summary>
     /// Persists the latest revision of every key the publisher signed, so revisions keep increasing across restarts and
-    /// resources removed while the publisher was offline are withdrawn at the next start.
+    /// resources removed while the publisher was offline are withdrawn at the next start. Every member is thread safe, so
+    /// the resources of one synchronization can record their publications at once; <see cref="Save"/> writes the file
+    /// only when something changed, so it is cheap to call after every synchronization regardless of how many resources
+    /// it touched.
     /// </summary>
     internal sealed class PublicationLedger
     {
@@ -28,8 +32,12 @@ namespace MajDHTProvider.Publishing
 
         /// <summary>The ledger file path.</summary>
         private readonly string _path;
+        /// <summary>Protects the entries and the change flag.</summary>
+        private readonly Lock _gate = new();
         /// <summary>The latest signed state of every key, keyed by key name.</summary>
         private readonly Dictionary<string, PublicationLedgerEntry> _entries;
+        /// <summary>Whether an entry changed since the ledger was loaded or last saved.</summary>
+        private bool _changed;
 
         /// <summary>Creates a ledger backed by a file.</summary>
         /// <param name="path">The ledger file path.</param>
@@ -46,11 +54,14 @@ namespace MajDHTProvider.Publishing
             get
             {
                 var names = new List<string>();
-                foreach (var (name, entry) in _entries)
+                lock (_gate)
                 {
-                    if (!entry.Withdrawn)
+                    foreach (var (name, entry) in _entries)
                     {
-                        names.Add(name);
+                        if (!entry.Withdrawn)
+                        {
+                            names.Add(name);
+                        }
                     }
                 }
                 return names;
@@ -91,7 +102,10 @@ namespace MajDHTProvider.Publishing
         /// <returns>Whether the key was ever signed.</returns>
         public bool TryGet(string keyName, out PublicationLedgerEntry entry)
         {
-            return _entries.TryGetValue(keyName, out entry!);
+            lock (_gate)
+            {
+                return _entries.TryGetValue(keyName, out entry!);
+            }
         }
 
         /// <summary>
@@ -102,7 +116,11 @@ namespace MajDHTProvider.Publishing
         /// <returns>The next revision.</returns>
         public long NextRevision(string keyName)
         {
-            var previous = _entries.TryGetValue(keyName, out var entry) ? entry.Revision : 0;
+            long previous;
+            lock (_gate)
+            {
+                previous = _entries.TryGetValue(keyName, out var entry) ? entry.Revision : 0;
+            }
             return Math.Max(previous + 1, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
         }
 
@@ -112,7 +130,11 @@ namespace MajDHTProvider.Publishing
         /// <param name="fileHash">The published complete-file hash.</param>
         public void RecordPublished(string keyName, long revision, string fileHash)
         {
-            _entries[keyName] = new PublicationLedgerEntry(revision, fileHash, false);
+            lock (_gate)
+            {
+                _entries[keyName] = new PublicationLedgerEntry(revision, fileHash, false);
+                _changed = true;
+            }
         }
 
         /// <summary>Records a signed withdrawal.</summary>
@@ -120,26 +142,54 @@ namespace MajDHTProvider.Publishing
         /// <param name="revision">The signed withdrawal revision.</param>
         public void RecordWithdrawn(string keyName, long revision)
         {
-            _entries[keyName] = new PublicationLedgerEntry(revision, null, true);
+            lock (_gate)
+            {
+                _entries[keyName] = new PublicationLedgerEntry(revision, null, true);
+                _changed = true;
+            }
         }
 
-        /// <summary>Writes the ledger atomically.</summary>
-        /// <exception cref="IOException">The file cannot be written.</exception>
-        public void Save()
+        /// <summary>Writes the ledger atomically when an entry changed since it was loaded or last saved.</summary>
+        /// <returns>Whether the file was written.</returns>
+        /// <exception cref="IOException">The file cannot be written; the changes stay pending for the next save.</exception>
+        public bool Save()
         {
-            var directory = Path.GetDirectoryName(_path);
-            if (directory != null)
+            string json;
+            lock (_gate)
             {
-                Directory.CreateDirectory(directory);
+                if (!_changed)
+                {
+                    return false;
+                }
+                var document = new PublicationLedgerDocument
+                {
+                    Version = FormatVersion,
+                    Publications = new SortedDictionary<string, PublicationLedgerEntry>(_entries, StringComparer.Ordinal)
+                };
+                json = JsonSerializer.Serialize(document, s_jsonOptions);
+                // Entries recorded while the file is written mark the ledger changed again and are saved next time.
+                _changed = false;
             }
-            var document = new PublicationLedgerDocument
+            try
             {
-                Version = FormatVersion,
-                Publications = new SortedDictionary<string, PublicationLedgerEntry>(_entries, StringComparer.Ordinal)
-            };
-            var temporary = _path + ".tmp";
-            File.WriteAllText(temporary, JsonSerializer.Serialize(document, s_jsonOptions));
-            File.Move(temporary, _path, true);
+                var directory = Path.GetDirectoryName(_path);
+                if (directory != null)
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                var temporary = _path + ".tmp";
+                File.WriteAllText(temporary, json);
+                File.Move(temporary, _path, true);
+                return true;
+            }
+            catch
+            {
+                lock (_gate)
+                {
+                    _changed = true;
+                }
+                throw;
+            }
         }
 
         /// <summary>The serialized ledger file.</summary>
