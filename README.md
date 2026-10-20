@@ -1,15 +1,18 @@
 # MajDHTProvider
 
 MajDHTProvider 是一个 .NET 10 命令行程序，通过 [MajDHTNetwork](modules/MajDHTNetwork)
-分发 MajdataPlay 在线谱面的资源文件。它有两种模式：
+分发 MajdataPlay 在线谱面的资源文件。它有三种模式：
 
 - **Publisher**：扫描谱面目录，把每个符合布局的资源文件以发布者身份签名发布；文件或谱面
   目录被删除时发布撤销。
 - **Replica**：为受信任的发布者提供资源。Peer 请求某个资源时，若本地已有且与发布内容一致则
   直接返回；否则从源站（Publisher）回源下载、保存到本地并转发给请求方。本地文件仅在发布者
   撤销时删除。
+- **Bootstrap**：只负责引导与节点交换，不发布也不提供任何内容，也没有谱面目录。它维护路由表、
+  应答发现请求并为记录建立索引，加 `--relay` 后还协助 NAT 穿透，适合部署在地址固定的主机上
+  作为其他节点的 `--bootstrap` 入口。
 
-两种模式都会监控目录变动。
+Publisher 与 Replica 都会监控目录变动。
 
 ## 目录布局与密钥
 
@@ -35,6 +38,7 @@ git submodule update --init
 dotnet build MajDHTProvider.slnx
 dotnet run --project src/MajDHTProvider -- publisher --root D:\charts
 dotnet run --project src/MajDHTProvider -- replica --root D:\mirror --publisher <发布者指纹> --bootstrap 203.0.113.10:42000
+dotnet run --project src/MajDHTProvider -- bootstrap --data D:\majdht-bootstrap --advertise 203.0.113.10 --relay
 ```
 
 Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`，Replica 的 `--publisher`
@@ -42,8 +46,8 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 
 | 选项 | 说明 |
 | --- | --- |
-| `--root <dir>` | 谱面根目录（必填）。 |
-| `--data <dir>` | 身份种子、发布账本与暂存目录，默认 `<root>/.majdht`。 |
+| `--root <dir>` | 谱面根目录（Publisher 与 Replica 必填，Bootstrap 不接受）。 |
+| `--data <dir>` | 身份种子、发布账本、缓存与暂存目录，默认 `<root>/.majdht`；Bootstrap 模式必填。 |
 | `--listen` / `--advertise` / `--bootstrap` | 监听地址、对外通告地址、引导节点 `ip:port`。 |
 | `--tcp-port` / `--udp-port` | 端口，默认 42000，`none` 关闭该传输。 |
 | `--relay` | 同时为其他节点提供中继与 NAT 穿透协助。 |
@@ -53,6 +57,9 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 | `--pull-wait` | （Replica）Peer 请求等待回源的时长，默认 3s，应小于 5 秒的请求超时。 |
 | `--quiet-period` / `--rescan-interval` | 目录事件静默期（默认 2s）与全量重扫间隔（默认 10m）。 |
 | `--parallelism` | 同时读取、发布、撤销、续签或校验的资源文件数，1–64，默认 8；节点的请求预算随之放大，使同样多的发布能同时复制。机械硬盘上可适当调低。 |
+
+Bootstrap 模式只接受网络与身份相关的选项（`--data`、`--listen`、`--advertise`、`--bootstrap`、端口、
+`--relay`、`--work-bits`、`--max-records`、`--log-level`），谱面相关选项会被拒绝。
 
 `<data>/identity.key` 是节点身份种子（机密），请备份并妥善保管；Publisher 丢失它将无法再
 以同一发布者身份发布或撤销。`<data>/publications.json` 是 Publisher 的发布账本，
@@ -87,8 +94,11 @@ Merkle 叶子、签名记录与文件戳记，让重启时不必重读文件；�
 - **目录监控**：`FileSystemWatcher` 事件按谱面合并，静默 `--quiet-period` 后再同步，避免处理
   复制到一半的文件；监控缓冲溢出或每个 `--rescan-interval` 触发全量重扫。
 - **路由表持久化**：启动时同时通过 `<data>/routing.bin` 中保存的联系人与 `--bootstrap` 加入网络，
-  其中任一成功即可；加入后与退出时都会把当前路由表保存回该文件（空表不会覆盖旧快照），因此
-  重启后即使引导节点不可用也能重新加入。
+  其中任一成功即可；加入后、每 10 分钟以及退出时都会把当前路由表保存回该文件（空表不会覆盖
+  旧快照），因此重启后即使引导节点不可用也能重新加入。
+- **Bootstrap**：节点不带 Download 与 Provide 能力，其他节点不会向它请求数据块，也不会把它当作
+  提供者；它只保留路由表、应答 Hello 与 Find、缓存其他发布者复制过来的记录，并定期保存路由表。
+  第一个 Bootstrap 节点可以不带 `--bootstrap` 启动，等待其他节点接入。
 - **重启不重读**：每个资源发布或提供后，其 Merkle 叶子、签名记录与文件戳记写入 `<data>/leaves`。
   重启扫描时，戳记未变的文件直接用缓存的叶子建立块索引并向节点注册：Publisher 在记录剩余寿命
   超过一半时原样导入（修订号不变），否则用叶子签发新修订号；Replica 直接按缓存的记录继续提供，
@@ -136,7 +146,8 @@ Provider 测试覆盖布局与密钥映射（含扫描给出的戳记）、命�
 从叶子建立索引与共享块的移除）、账本、身份、路由表与叶子缓存的持久化、重启后不重读文件的续发布
 与续提供、目录监控、
 Publisher/Replica 与真实回环 DHT 节点的集成（含数十个资源的并发发布、续签、撤销与采纳），以及
-Publisher 与 Replica 两个宿主的端到端流程（含通过保存的路由表重新加入网络）。
+Publisher、Replica 与 Bootstrap 宿主的端到端流程（含通过保存的路由表重新加入网络，以及只认识
+Bootstrap 节点的 Publisher 与 Replica 通过它互相发现）。
 
 ## 限制
 

@@ -17,6 +17,7 @@ namespace MajDHTProvider.Hosting
             Usage:
               MajDHTProvider publisher --root <dir> [options]
               MajDHTProvider replica --root <dir> --publisher <id> [options]
+              MajDHTProvider bootstrap --data <dir> [options]
 
             Modes:
               publisher  Publishes every <GUID>/<file> chart resource under the root and withdraws
@@ -24,10 +25,14 @@ namespace MajDHTProvider.Hosting
               replica    Serves the trusted publisher's resources from the root. A resource that a
                          peer requests but is missing locally is pulled from the origin, stored and
                          forwarded; local files are deleted only when the publisher withdraws them.
+              bootstrap  Joins the network only to introduce peers to each other: keeps a routing
+                         table, answers discovery requests and indexes records, and with --relay
+                         assists NAT traversal. It publishes and serves no content and needs no root.
 
             Common options:
-              --root <dir>                 Chart root directory (required).
-              --data <dir>                 Identity, ledger and staging directory (default: <root>/.majdht).
+              --root <dir>                 Chart root directory (required by publisher and replica).
+              --data <dir>                 Identity, ledger, cache and staging directory (default: <root>/.majdht;
+                                           required by bootstrap).
               --listen <ip>                Listen address; give one IPv4 and one IPv6 address for dual stack
                                            (default: 0.0.0.0).
               --advertise <ip>             Address advertised to peers; repeatable, at most 4.
@@ -77,9 +82,11 @@ namespace MajDHTProvider.Hosting
                 {
                     "publisher" => ProviderMode.Publisher,
                     "replica" => ProviderMode.Replica,
-                    _ => throw new CommandLineException($"Unknown mode '{args[0]}'; expected publisher or replica.")
+                    "bootstrap" => ProviderMode.Bootstrap,
+                    _ => throw new CommandLineException($"Unknown mode '{args[0]}'; expected publisher, replica or bootstrap.")
                 }
             };
+            var chartOnly = new List<string>();
             var replicaOnly = new List<string>();
             var publisherOnly = new List<string>();
             for (var index = 1; index < args.Count; index++)
@@ -110,6 +117,7 @@ namespace MajDHTProvider.Hosting
                 {
                     case "--root":
                         options.RootDirectory = value;
+                        chartOnly.Add(name);
                         break;
                     case "--data":
                         options.DataDirectory = value;
@@ -138,21 +146,26 @@ namespace MajDHTProvider.Hosting
                         break;
                     case "--quiet-period":
                         options.QuietPeriod = ParseDuration(name, value);
+                        chartOnly.Add(name);
                         break;
                     case "--rescan-interval":
                         options.RescanInterval = ParseDuration(name, value);
+                        chartOnly.Add(name);
                         break;
                     case "--parallelism":
                         options.Parallelism = ParseInteger(name, value, 1, 64);
+                        chartOnly.Add(name);
                         break;
                     case "--max-records":
                         options.MaxRecords = ParseInteger(name, value, 1, 65536);
                         break;
                     case "--max-local-leaves":
                         options.MaxLocalLeaves = ParseInteger(name, value, 1, 16777216);
+                        chartOnly.Add(name);
                         break;
                     case "--cache-mb":
                         options.BlockCacheCapacity = ParseInteger(name, value, 1, 65536) * 1024L * 1024;
+                        chartOnly.Add(name);
                         break;
                     case "--log-level":
                         options.LogLevel = ParseLogLevel(value);
@@ -173,7 +186,13 @@ namespace MajDHTProvider.Hosting
                         throw new CommandLineException($"Unknown option '{name}'.");
                 }
             }
-            Validate(options, options.Mode == ProviderMode.Publisher ? replicaOnly : publisherOnly);
+            var foreignOptions = options.Mode switch
+            {
+                ProviderMode.Publisher => replicaOnly,
+                ProviderMode.Replica => publisherOnly,
+                _ => [.. chartOnly, .. publisherOnly, .. replicaOnly]
+            };
+            Validate(options, foreignOptions);
             return options;
         }
 
@@ -224,7 +243,11 @@ namespace MajDHTProvider.Hosting
             {
                 throw new CommandLineException($"{foreignOptions[0]} is not valid in {options.Mode.ToString().ToLowerInvariant()} mode.");
             }
-            if (string.IsNullOrWhiteSpace(options.RootDirectory))
+            if (options.Mode == ProviderMode.Bootstrap && string.IsNullOrWhiteSpace(options.DataDirectory))
+            {
+                throw new CommandLineException("--data is required in bootstrap mode.");
+            }
+            if (options.Mode != ProviderMode.Bootstrap && string.IsNullOrWhiteSpace(options.RootDirectory))
             {
                 throw new CommandLineException("--root is required.");
             }

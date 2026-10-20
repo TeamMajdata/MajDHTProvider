@@ -37,6 +37,27 @@ namespace MajDHTProvider.Tests
             Assert.Equal(4 * 1024 * 1024, node.MaxLocalLeaves);
         }
 
+        /// <summary>Parses bootstrap mode, which needs a data directory instead of a root and advertises no content capability.</summary>
+        [Fact]
+        public void BootstrapOptions()
+        {
+            var options = CommandLineParser.Parse(
+            [
+                "bootstrap", "--data", "state", "--listen", "0.0.0.0", "--advertise", "203.0.113.7",
+                "--bootstrap", "198.51.100.1:42000", "--work-bits", "0", "--max-records", "4096"
+            ])!;
+            Assert.Equal(ProviderMode.Bootstrap, options.Mode);
+            Assert.Equal(Path.GetFullPath("state"), options.GetDataDirectory());
+            Assert.Equal(string.Empty, options.RootDirectory);
+            var node = options.CreateNodeOptions(NullLogger.Instance);
+            Assert.Equal((DHTCapabilities)0, node.Capabilities);
+            Assert.Equal(4096, node.MaxRecords);
+            Assert.Equal(IPEndPoint.Parse("198.51.100.1:42000"), Assert.Single(node.BootstrapEndpoints));
+
+            var relay = CommandLineParser.Parse(["bootstrap", "--data", "state", "--relay"])!.CreateNodeOptions(NullLogger.Instance);
+            Assert.Equal(DHTCapabilities.Relay, relay.Capabilities);
+        }
+
         /// <summary>Raises the node's request budget so every synchronized resource can replicate at once, and never lowers it.</summary>
         [Fact]
         public void ParallelismSizesTheRequestBudget()
@@ -114,6 +135,13 @@ namespace MajDHTProvider.Tests
         [InlineData("replica --root x")]
         [InlineData("replica --root x --publisher abc")]
         [InlineData("replica --root x --publisher " + PublisherId + " --record-lifetime 1h")]
+        [InlineData("bootstrap")]
+        [InlineData("bootstrap --data x --root y")]
+        [InlineData("bootstrap --data x --parallelism 4")]
+        [InlineData("bootstrap --data x --cache-mb 8")]
+        [InlineData("bootstrap --data x --quiet-period 1s")]
+        [InlineData("bootstrap --data x --record-lifetime 1h")]
+        [InlineData("bootstrap --data x --publisher " + PublisherId)]
         [InlineData("publisher --root x --tcp-port none --udp-port none")]
         [InlineData("publisher --root x --tcp-port 70000")]
         [InlineData("publisher --root x --work-bits 21")]

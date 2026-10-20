@@ -22,10 +22,13 @@ namespace MajDHTProvider.Hosting
         /// <summary>Gets or sets the provider mode.</summary>
         public ProviderMode Mode { get; set; }
 
-        /// <summary>Gets or sets the chart root directory containing <c>&lt;GUID&gt;/&lt;file&gt;</c> resources.</summary>
+        /// <summary>Gets or sets the chart root directory containing <c>&lt;GUID&gt;/&lt;file&gt;</c> resources; empty in bootstrap mode.</summary>
         public string RootDirectory { get; set; } = string.Empty;
 
-        /// <summary>Gets or sets the directory for the identity seed, publication ledger and staging files, or null for the default.</summary>
+        /// <summary>
+        /// Gets or sets the directory for the identity seed, publication ledger, caches and staging files, or null for the
+        /// default below the chart root; bootstrap mode has no root and requires it.
+        /// </summary>
         public string? DataDirectory { get; set; }
 
         /// <summary>Gets or sets the trusted publisher fingerprint a replica serves; required in replica mode.</summary>
@@ -98,12 +101,13 @@ namespace MajDHTProvider.Hosting
         /// <summary>Creates the DHT node configuration.</summary>
         /// <param name="logger">Receives DHT node diagnostics.</param>
         /// <returns>
-        /// Node options with download and provide capabilities, plus relay when enabled, whose request budget admits
-        /// <see cref="Parallelism"/> replications at once.
+        /// Node options with download and provide capabilities, or none in bootstrap mode, plus relay when enabled, whose
+        /// request budget admits <see cref="Parallelism"/> replications at once.
         /// </returns>
         public DHTNodeOptions CreateNodeOptions(ILogger logger)
         {
-            var capabilities = DHTCapabilities.Download | DHTCapabilities.Provide;
+            // A bootstrap node advertises no content capability: peers never ask it for blocks and never see it as a provider.
+            var capabilities = Mode == ProviderMode.Bootstrap ? default : DHTCapabilities.Download | DHTCapabilities.Provide;
             if (EnableRelay)
             {
                 capabilities |= DHTCapabilities.Relay;

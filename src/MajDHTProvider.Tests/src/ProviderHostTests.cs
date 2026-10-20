@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using MajDHTNetwork;
 using MajDHTProvider.Charts;
 using MajDHTProvider.Hosting;
+using MajDHTProvider.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -153,6 +154,97 @@ namespace MajDHTProvider.Tests
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publisherRun);
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => secondRun);
             Assert.True(File.Exists(Path.Combine(publisherOptions.GetDataDirectory(), RoutingTableFile.FileName)));
+        }
+
+        /// <summary>
+        /// Runs a bootstrap host that publishes and serves nothing: a publisher and a replica that know only the bootstrap
+        /// node find each other through it, and the replica pulls a chart from the publisher.
+        /// </summary>
+        /// <returns>Completion after every host stopped.</returns>
+        [Fact]
+        public async Task BootstrapHostIntroducesPublisherAndReplica()
+        {
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(90));
+            var token = deadline.Token;
+            using var directory = new TestDirectory();
+            var publisherRoot = directory.Combine("publisher");
+            var replicaRoot = directory.Combine("replica");
+            var bootstrapPort = FreeTcpPort();
+            var publisherPort = FreeTcpPort();
+            var replicaPort = FreeTcpPort();
+            var bootstrapOptions = CommandLineParser.Parse(
+            [
+                "bootstrap", "--data", directory.Combine("bootstrap"), "--listen", "127.0.0.1", "--tcp-port", bootstrapPort.ToString(),
+                "--udp-port", "none", "--work-bits", "0"
+            ])!;
+            using var stopping = CancellationTokenSource.CreateLinkedTokenSource(token);
+            var bootstrapRun = new ProviderHost(bootstrapOptions, NullLoggerFactory.Instance).RunAsync(stopping.Token);
+            var bootstrapId = await ReadNodeIdAsync(bootstrapOptions, token);
+            var readerOptions = TestSupport.NodeOptions(DHTCapabilities.Download);
+            readerOptions.BootstrapEndpoints.Add(new IPEndPoint(IPAddress.Loopback, bootstrapPort));
+            await using var reader = new MajDHTNode(readerOptions);
+            await reader.StartAsync(token);
+            await TestSupport.WaitUntilAsync(async () => await TryBootstrapAsync(reader, token), token);
+            var bootstrapPeer = reader.KnownPeers.Single(peer => peer.NodeId == bootstrapId);
+            Assert.Equal((DHTCapabilities)0, bootstrapPeer.Capabilities);
+
+            var publisherOptions = CommandLineParser.Parse(
+            [
+                "publisher", "--root", publisherRoot, "--listen", "127.0.0.1", "--tcp-port", publisherPort.ToString(),
+                "--udp-port", "none", "--work-bits", "0", "--bootstrap", $"127.0.0.1:{bootstrapPort}", "--quiet-period", "200ms"
+            ])!;
+            var publisherRun = new ProviderHost(publisherOptions, NullLoggerFactory.Instance).RunAsync(stopping.Token);
+            var publisherId = await ReadNodeIdAsync(publisherOptions, token);
+            var replicaOptions = CommandLineParser.Parse(
+            [
+                "replica", "--root", replicaRoot, "--publisher", publisherId, "--listen", "127.0.0.1",
+                "--tcp-port", replicaPort.ToString(), "--udp-port", "none", "--work-bits", "0",
+                "--bootstrap", $"127.0.0.1:{bootstrapPort}", "--quiet-period", "200ms", "--refresh-interval", "1s", "--pull-wait", "4s"
+            ])!;
+            var replicaRun = new ProviderHost(replicaOptions, NullLoggerFactory.Instance).RunAsync(stopping.Token);
+            var replicaId = await ReadNodeIdAsync(replicaOptions, token);
+            // Through the bootstrap node alone, the reader learns both the publisher and the replica.
+            DHTPeer? replicaPeer = null;
+            await TestSupport.WaitUntilAsync(async () =>
+            {
+                await reader.BootstrapAsync(token);
+                replicaPeer = reader.KnownPeers.SingleOrDefault(peer => peer.NodeId == replicaId);
+                return replicaPeer != null && reader.KnownPeers.Any(peer => peer.NodeId == publisherId);
+            }, token);
+
+            var resource = new ChartResource(Guid.NewGuid(), ChartResourceKind.Maidata);
+            var content = TestSupport.WriteResource(publisherRoot, resource, 30000);
+            var key = new DHTKey(publisherId, resource.KeyName);
+            DHTRecord? record = null;
+            await TestSupport.WaitUntilAsync(async () => (record = await reader.ResolveAsync(key, token)) != null, token);
+            await TestSupport.WaitUntilAsync(async () => await TryReadBlockAsync(reader, record!, replicaPeer!, token), token);
+            var replicaFile = TestSupport.ResourcePath(replicaRoot, resource);
+            await TestSupport.WaitUntilAsync(() => Task.FromResult(File.Exists(replicaFile)), token);
+            TestSupport.AssertBytes(content, await File.ReadAllBytesAsync(replicaFile, token));
+
+            await stopping.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => publisherRun);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => replicaRun);
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => bootstrapRun);
+            Assert.True(File.Exists(Path.Combine(bootstrapOptions.GetDataDirectory(), RoutingTableFile.FileName)));
+            Assert.False(Directory.Exists(Path.Combine(bootstrapOptions.GetDataDirectory(), LeafCache.DirectoryName)));
+        }
+
+        /// <summary>Tries to join the network through the configured bootstrap endpoints.</summary>
+        /// <param name="node">The joining node.</param>
+        /// <param name="cancellationToken">The test deadline.</param>
+        /// <returns>Whether a bootstrap endpoint answered.</returns>
+        private static async Task<bool> TryBootstrapAsync(MajDHTNode node, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await node.BootstrapAsync(cancellationToken) != 0;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
         }
 
         /// <summary>Reads the node ID from a host's identity file once the host created it.</summary>
