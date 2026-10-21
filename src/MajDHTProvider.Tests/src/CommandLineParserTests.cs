@@ -43,7 +43,7 @@ namespace MajDHTProvider.Tests
         {
             var options = CommandLineParser.Parse(
             [
-                "bootstrap", "--data", "state", "--listen", "0.0.0.0", "--advertise", "203.0.113.7",
+                "bootstrap", "--data", "state", "--listen", "0.0.0.0", "--public",
                 "--bootstrap", "198.51.100.1:42000", "--work-bits", "0", "--max-records", "4096"
             ])!;
             Assert.Equal(ProviderMode.Bootstrap, options.Mode);
@@ -51,11 +51,14 @@ namespace MajDHTProvider.Tests
             Assert.Equal(string.Empty, options.RootDirectory);
             var node = options.CreateNodeOptions(NullLogger.Instance);
             Assert.Equal((DHTCapabilities)0, node.Capabilities);
+            Assert.True(node.PubliclyReachable);
             Assert.Equal(4096, node.MaxRecords);
             Assert.Equal(IPEndPoint.Parse("198.51.100.1:42000"), Assert.Single(node.BootstrapEndpoints));
 
-            var relay = CommandLineParser.Parse(["bootstrap", "--data", "state", "--relay"])!.CreateNodeOptions(NullLogger.Instance);
-            Assert.Equal(DHTCapabilities.Relay, relay.Capabilities);
+            var traversal = CommandLineParser.Parse(["bootstrap", "--data", "state", "--traversal"])!.CreateNodeOptions(NullLogger.Instance);
+            Assert.Equal(DHTCapabilities.Traversal, traversal.Capabilities);
+            var forwarder = CommandLineParser.Parse(["bootstrap", "--data", "state", "--forwarder"])!.CreateNodeOptions(NullLogger.Instance);
+            Assert.Equal(DHTCapabilities.Forwarder, forwarder.Capabilities);
         }
 
         /// <summary>Raises the node's request budget so every synchronized resource can replicate at once, and never lowers it.</summary>
@@ -80,9 +83,9 @@ namespace MajDHTProvider.Tests
             var options = CommandLineParser.Parse(
             [
                 "replica", "--root=cache", "--publisher", PublisherId, "--data", "state",
-                "--listen", "0.0.0.0", "--listen", "::", "--advertise", "203.0.113.7",
+                "--listen", "0.0.0.0", "--listen", "::",
                 "--bootstrap", "198.51.100.1:42000", "--bootstrap=[2001:db8::1]:42001",
-                "--tcp-port", "0", "--udp-port", "none", "--relay", "--work-bits", "0",
+                "--tcp-port", "0", "--udp-port", "none", "--traversal", "--forwarder", "--work-bits", "0",
                 "--quiet-period", "500ms", "--rescan-interval", "1h", "--refresh-interval", "00:05:00", "--pull-wait", "2s",
                 "--parallelism", "2", "--max-records", "100", "--max-local-leaves", "1000", "--cache-mb", "8", "--log-level", "debug"
             ])!;
@@ -91,11 +94,12 @@ namespace MajDHTProvider.Tests
             Assert.Equal(PublisherId.ToLowerInvariant(), options.PublisherId);
             Assert.Equal(Path.GetFullPath("state"), options.GetDataDirectory());
             Assert.Equal(2, options.ListenAddresses.Count);
-            Assert.Equal(IPAddress.Parse("203.0.113.7"), Assert.Single(options.AdvertisedAddresses));
+            Assert.False(options.PubliclyReachable);
             Assert.Equal(IPEndPoint.Parse("[2001:db8::1]:42001"), options.BootstrapEndpoints[1]);
             Assert.Equal(0, options.TcpPort);
             Assert.Null(options.UdpPort);
-            Assert.True(options.EnableRelay);
+            Assert.True(options.EnableTraversal);
+            Assert.True(options.EnableForwarder);
             Assert.Equal(TimeSpan.FromMilliseconds(500), options.QuietPeriod);
             Assert.Equal(TimeSpan.FromHours(1), options.RescanInterval);
             Assert.Equal(TimeSpan.FromMinutes(5), options.RefreshInterval);
@@ -103,7 +107,8 @@ namespace MajDHTProvider.Tests
             Assert.Equal(8L * 1024 * 1024, options.BlockCacheCapacity);
             Assert.Equal(LogLevel.Debug, options.LogLevel);
             var node = options.CreateNodeOptions(NullLogger.Instance);
-            Assert.Equal(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay, node.Capabilities);
+            Assert.Equal(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Traversal | DHTCapabilities.Forwarder, node.Capabilities);
+            Assert.False(node.PubliclyReachable);
             Assert.Equal(DHTTransport.Tcp, node.PreferredTransport);
             Assert.Equal(100, node.MaxRecords);
             Assert.Equal(1000, node.MaxLocalLeaves);
@@ -153,7 +158,11 @@ namespace MajDHTProvider.Tests
         [InlineData("publisher --root x --parallelism 65")]
         [InlineData("publisher --root x --record-lifetime 8d")]
         [InlineData("publisher --root x --log-level verbose")]
-        [InlineData("publisher --root x --relay=yes")]
+        [InlineData("publisher --root x --relay")]
+        [InlineData("publisher --root x --advertise 203.0.113.7")]
+        [InlineData("publisher --root x --public=yes")]
+        [InlineData("publisher --root x --traversal=yes")]
+        [InlineData("publisher --root x --forwarder=yes")]
         public void InvalidCommandLinesAreRejected(string commandLine)
         {
             var args = commandLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);

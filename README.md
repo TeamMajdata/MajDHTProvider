@@ -9,8 +9,8 @@ MajDHTProvider 是一个 .NET 10 命令行程序，通过 [MajDHTNetwork](module
   直接返回；否则从源站（Publisher）回源下载、保存到本地并转发给请求方。本地文件仅在发布者
   撤销时删除。
 - **Bootstrap**：只负责引导与节点交换，不发布也不提供任何内容，也没有谱面目录。它维护路由表、
-  应答发现请求并为记录建立索引，加 `--relay` 后还协助 NAT 穿透，适合部署在地址固定的主机上
-  作为其他节点的 `--bootstrap` 入口。
+  应答发现请求并为记录建立索引，加 `--traversal` 后还为 NAT 后的节点协调直连，加 `--forwarder`
+  后还为无法直连的节点转发加密流量，适合部署在地址固定的主机上作为其他节点的 `--bootstrap` 入口。
 
 Publisher 与 Replica 都会监控目录变动。
 
@@ -38,7 +38,7 @@ git submodule update --init
 dotnet build MajDHTProvider.slnx
 dotnet run --project src/MajDHTProvider -- publisher --root D:\charts
 dotnet run --project src/MajDHTProvider -- replica --root D:\mirror --publisher <发布者指纹> --bootstrap 203.0.113.10:42000
-dotnet run --project src/MajDHTProvider -- bootstrap --data D:\majdht-bootstrap --advertise 203.0.113.10 --relay
+dotnet run --project src/MajDHTProvider -- bootstrap --data D:\majdht-bootstrap --public --traversal --forwarder
 ```
 
 Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`，Replica 的 `--publisher`
@@ -48,9 +48,11 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 | --- | --- |
 | `--root <dir>` | 谱面根目录（Publisher 与 Replica 必填，Bootstrap 不接受）。 |
 | `--data <dir>` | 身份种子、发布账本、缓存与暂存目录，默认 `<root>/.majdht`；Bootstrap 模式必填。 |
-| `--listen` / `--advertise` / `--bootstrap` | 监听地址、对外通告地址、引导节点 `ip:port`。 |
+| `--listen` / `--bootstrap` | 监听地址、引导节点 `ip:port`。节点不通告自己的地址，对端以观测到的端点为准。 |
+| `--public` | 监听端口可从外网直接访问（固定公网地址或路由器端口映射）；节点立即通告公网可达并跳过自身的可达性回拨检查。 |
 | `--tcp-port` / `--udp-port` | 端口，默认 42000，`none` 关闭该传输。 |
-| `--relay` | 同时为其他节点提供中继与 NAT 穿透协助。 |
+| `--traversal` | 同时作为 Traversal 节点：记录已注册节点的观测端点，为 NAT 后的节点协调打洞与回拨。 |
+| `--forwarder` | 同时作为 Forwarder：为无法直连的节点维持转发会话并转发端到端加密的流量。 |
 | `--work-bits` | 网络要求的身份工作量，默认 12，全网必须一致。 |
 | `--record-lifetime` | （Publisher）发布有效期，默认 24h，到半衰期自动续签。 |
 | `--refresh-interval` | （Replica）检查撤销与更新的间隔，默认 10m。 |
@@ -58,8 +60,8 @@ Publisher 启动时会打印 `Publisher ID for replicas and clients: <指纹>`�
 | `--quiet-period` / `--rescan-interval` | 目录事件静默期（默认 2s）与全量重扫间隔（默认 10m）。 |
 | `--parallelism` | 同时读取、发布、撤销、续签或校验的资源文件数，1–64，默认 8；节点的请求预算随之放大，使同样多的发布能同时复制。机械硬盘上可适当调低。 |
 
-Bootstrap 模式只接受网络与身份相关的选项（`--data`、`--listen`、`--advertise`、`--bootstrap`、端口、
-`--relay`、`--work-bits`、`--max-records`、`--log-level`），谱面相关选项会被拒绝。
+Bootstrap 模式只接受网络与身份相关的选项（`--data`、`--listen`、`--public`、`--bootstrap`、端口、
+`--traversal`、`--forwarder`、`--work-bits`、`--max-records`、`--log-level`），谱面相关选项会被拒绝。
 
 `<data>/identity.key` 是节点身份种子（机密），请备份并妥善保管；Publisher 丢失它将无法再
 以同一发布者身份发布或撤销。`<data>/publications.json` 是 Publisher 的发布账本，

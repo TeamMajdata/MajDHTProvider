@@ -280,14 +280,28 @@ namespace MajDHTProvider.Hosting
                     _logger.LogInformation("Serving resources of publisher {PublisherId}.", _options.PublisherId);
                     break;
                 default:
-                    _logger.LogInformation("Introducing peers to each other{Relay}; no content is published or served.",
-                        _options.EnableRelay ? " and assisting NAT traversal" : string.Empty);
+                    _logger.LogInformation("Introducing peers to each other{Assistance}; no content is published or served.",
+                        DescribeAssistance(_options));
                     break;
             }
             foreach (var endpoint in node.LocalPeer.Endpoints)
             {
                 _logger.LogInformation("Listening on {Address} (TCP {TcpPort}, UDP {UdpPort}).", endpoint.Address, endpoint.TcpPort, endpoint.UdpPort);
             }
+        }
+
+        /// <summary>Describes the NAT assistance a node offers, for the start-up log.</summary>
+        /// <param name="options">The provider options.</param>
+        /// <returns>An empty string, or a clause naming the enabled Traversal and Forwarder roles.</returns>
+        private static string DescribeAssistance(ProviderOptions options)
+        {
+            return (options.EnableTraversal, options.EnableForwarder) switch
+            {
+                (true, true) => " and coordinating direct connections and forwarding traffic for peers behind NAT",
+                (true, false) => " and coordinating direct connections for peers behind NAT",
+                (false, true) => " and forwarding traffic for peers behind NAT",
+                _ => string.Empty
+            };
         }
     }
 }

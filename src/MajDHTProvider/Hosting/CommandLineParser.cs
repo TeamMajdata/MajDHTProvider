@@ -26,8 +26,9 @@ namespace MajDHTProvider.Hosting
                          peer requests but is missing locally is pulled from the origin, stored and
                          forwarded; local files are deleted only when the publisher withdraws them.
               bootstrap  Joins the network only to introduce peers to each other: keeps a routing
-                         table, answers discovery requests and indexes records, and with --relay
-                         assists NAT traversal. It publishes and serves no content and needs no root.
+                         table, answers discovery requests and indexes records, and with --traversal
+                         or --forwarder assists peers behind NAT. It publishes and serves no content
+                         and needs no root.
 
             Common options:
               --root <dir>                 Chart root directory (required by publisher and replica).
@@ -35,11 +36,14 @@ namespace MajDHTProvider.Hosting
                                            required by bootstrap).
               --listen <ip>                Listen address; give one IPv4 and one IPv6 address for dual stack
                                            (default: 0.0.0.0).
-              --advertise <ip>             Address advertised to peers; repeatable, at most 4.
+              --public                     The listeners accept packets from other networks, for example on a
+                                           fixed public address or behind a router port mapping; skips the
+                                           reachability checks.
               --bootstrap <ip:port>        Known node used to join the network; repeatable, at most 16.
               --tcp-port <port|none>       TCP port, 0 for any free port (default: 42000).
               --udp-port <port|none>       UDP port, 0 for any free port (default: 42000).
-              --relay                      Also relay and assist NAT traversal for other peers.
+              --traversal                  Also coordinate direct connections and dial-backs for peers behind NAT.
+              --forwarder                  Also relay encrypted traffic between peers that cannot connect directly.
               --work-bits <0-20>           Identity work required by the network (default: 12).
               --quiet-period <duration>    Wait after the last file event of a chart (default: 2s).
               --rescan-interval <duration> Interval of full directory rescans (default: 10m).
@@ -103,13 +107,8 @@ namespace MajDHTProvider.Hosting
                 var separator = argument.IndexOf('=');
                 var name = separator < 0 ? argument : argument[..separator];
                 var inlineValue = separator < 0 ? null : argument[(separator + 1)..];
-                if (name == "--relay")
+                if (TryApplyFlag(options, name, inlineValue))
                 {
-                    if (inlineValue != null)
-                    {
-                        throw new CommandLineException("--relay does not take a value.");
-                    }
-                    options.EnableRelay = true;
                     continue;
                 }
                 var value = inlineValue ?? TakeNextValue(args, ref index, name);
@@ -128,9 +127,6 @@ namespace MajDHTProvider.Hosting
                         break;
                     case "--listen":
                         options.ListenAddresses.Add(ParseAddress(name, value));
-                        break;
-                    case "--advertise":
-                        options.AdvertisedAddresses.Add(ParseAddress(name, value));
                         break;
                     case "--bootstrap":
                         options.BootstrapEndpoints.Add(ParseEndpoint(value));
@@ -263,10 +259,6 @@ namespace MajDHTProvider.Hosting
             {
                 throw new CommandLineException("--listen accepts at most one IPv4 and one IPv6 address.");
             }
-            if (options.AdvertisedAddresses.Count > 4)
-            {
-                throw new CommandLineException("--advertise accepts at most 4 addresses.");
-            }
             if (options.BootstrapEndpoints.Count > 16)
             {
                 throw new CommandLineException("--bootstrap accepts at most 16 endpoints.");
@@ -275,6 +267,33 @@ namespace MajDHTProvider.Hosting
             {
                 throw new CommandLineException("--record-lifetime must be between 1s and 7d.");
             }
+        }
+
+        /// <summary>Applies an option that takes no value, such as <c>--public</c>.</summary>
+        /// <param name="options">The options being filled.</param>
+        /// <param name="name">The option name.</param>
+        /// <param name="inlineValue">The value given after <c>=</c>, or null.</param>
+        /// <returns>Whether the name is a flag; false for options that take a value.</returns>
+        /// <exception cref="CommandLineException">A flag was given a value.</exception>
+        private static bool TryApplyFlag(ProviderOptions options, string name, string? inlineValue)
+        {
+            Action<ProviderOptions>? apply = name switch
+            {
+                "--public" => static target => target.PubliclyReachable = true,
+                "--traversal" => static target => target.EnableTraversal = true,
+                "--forwarder" => static target => target.EnableForwarder = true,
+                _ => null
+            };
+            if (apply == null)
+            {
+                return false;
+            }
+            if (inlineValue != null)
+            {
+                throw new CommandLineException($"{name} does not take a value.");
+            }
+            apply(options);
+            return true;
         }
 
         /// <summary>Checks whether an argument requests help.</summary>

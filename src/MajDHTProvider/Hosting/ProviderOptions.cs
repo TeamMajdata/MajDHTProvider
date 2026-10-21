@@ -37,8 +37,11 @@ namespace MajDHTProvider.Hosting
         /// <summary>Gets the listen addresses; empty means the IPv4 wildcard address.</summary>
         public List<IPAddress> ListenAddresses { get; } = [];
 
-        /// <summary>Gets the addresses advertised in the signed contact, for fixed public addresses or port mappings.</summary>
-        public List<IPAddress> AdvertisedAddresses { get; } = [];
+        /// <summary>
+        /// Gets or sets whether the listeners are known to accept unsolicited packets from other networks, for example on a
+        /// fixed public address or behind a router port mapping; the node then advertises public reachability at once.
+        /// </summary>
+        public bool PubliclyReachable { get; set; }
 
         /// <summary>Gets the endpoints of known nodes used to join the network.</summary>
         public List<IPEndPoint> BootstrapEndpoints { get; } = [];
@@ -49,8 +52,17 @@ namespace MajDHTProvider.Hosting
         /// <summary>Gets or sets the UDP listening port, 0 for an OS-assigned port, or null to disable UDP.</summary>
         public int? UdpPort { get; set; } = DefaultPort;
 
-        /// <summary>Gets or sets whether the node also relays and assists NAT traversal for other peers.</summary>
-        public bool EnableRelay { get; set; }
+        /// <summary>
+        /// Gets or sets whether the node also acts as a Traversal node: it observes the endpoints of registered peers and
+        /// coordinates their direct connections and dial-backs.
+        /// </summary>
+        public bool EnableTraversal { get; set; }
+
+        /// <summary>
+        /// Gets or sets whether the node also acts as a Forwarder: it hosts forwarding sessions and relays end-to-end
+        /// encrypted envelopes between peers that cannot connect directly.
+        /// </summary>
+        public bool EnableForwarder { get; set; }
 
         /// <summary>Gets or sets the identity work required by the network, 0 to 20 bits; it must match every node.</summary>
         public int IdentityWorkBits { get; set; } = 12;
@@ -101,21 +113,25 @@ namespace MajDHTProvider.Hosting
         /// <summary>Creates the DHT node configuration.</summary>
         /// <param name="logger">Receives DHT node diagnostics.</param>
         /// <returns>
-        /// Node options with download and provide capabilities, or none in bootstrap mode, plus relay when enabled, whose
-        /// request budget admits <see cref="Parallelism"/> replications at once.
+        /// Node options with download and provide capabilities, or none in bootstrap mode, plus the Traversal and Forwarder
+        /// capabilities when enabled, whose request budget admits <see cref="Parallelism"/> replications at once.
         /// </returns>
         public DHTNodeOptions CreateNodeOptions(ILogger logger)
         {
             // A bootstrap node advertises no content capability: peers never ask it for blocks and never see it as a provider.
             var capabilities = Mode == ProviderMode.Bootstrap ? default : DHTCapabilities.Download | DHTCapabilities.Provide;
-            if (EnableRelay)
+            if (EnableTraversal)
             {
-                capabilities |= DHTCapabilities.Relay;
+                capabilities |= DHTCapabilities.Traversal;
+            }
+            if (EnableForwarder)
+            {
+                capabilities |= DHTCapabilities.Forwarder;
             }
             var nodeOptions = new DHTNodeOptions
             {
                 ListenAddresses = ListenAddresses.Count == 0 ? [IPAddress.Any] : [.. ListenAddresses],
-                AdvertisedAddresses = [.. AdvertisedAddresses],
+                PubliclyReachable = PubliclyReachable,
                 BootstrapEndpoints = [.. BootstrapEndpoints],
                 TcpPort = TcpPort,
                 UdpPort = UdpPort,
