@@ -28,6 +28,7 @@ namespace MajDHTProvider.Tests
             Assert.Equal(ProviderOptions.DefaultPort, options.TcpPort);
             Assert.Equal(ProviderOptions.DefaultPort, options.UdpPort);
             Assert.Equal(TimeSpan.FromHours(24), options.RecordLifetime);
+            Assert.Equal(TimeSpan.FromMinutes(30), options.RepublishInterval);
             Assert.Equal(ProviderOptions.DefaultParallelism, options.Parallelism);
             Assert.Equal(LogLevel.Information, options.LogLevel);
             var node = options.CreateNodeOptions(NullLogger.Instance);
@@ -35,6 +36,7 @@ namespace MajDHTProvider.Tests
             Assert.Equal(DHTCapabilities.Download | DHTCapabilities.Provide, node.Capabilities);
             Assert.Equal(12, node.IdentityWorkBits);
             Assert.Equal(4 * 1024 * 1024, node.MaxLocalLeaves);
+            Assert.Equal(TimeSpan.FromMinutes(30), node.RepublishInterval);
         }
 
         /// <summary>Parses bootstrap mode, which needs a data directory instead of a root and advertises no content capability.</summary>
@@ -87,6 +89,7 @@ namespace MajDHTProvider.Tests
                 "--bootstrap", "198.51.100.1:42000", "--bootstrap=[2001:db8::1]:42001",
                 "--tcp-port", "0", "--udp-port", "none", "--traversal", "--forwarder", "--work-bits", "0",
                 "--quiet-period", "500ms", "--rescan-interval", "1h", "--refresh-interval", "00:05:00", "--pull-wait", "2s",
+                "--republish-interval", "10m",
                 "--parallelism", "2", "--max-records", "100", "--max-local-leaves", "1000", "--cache-mb", "8", "--log-level", "debug"
             ])!;
             Assert.Equal(ProviderMode.Replica, options.Mode);
@@ -104,6 +107,7 @@ namespace MajDHTProvider.Tests
             Assert.Equal(TimeSpan.FromHours(1), options.RescanInterval);
             Assert.Equal(TimeSpan.FromMinutes(5), options.RefreshInterval);
             Assert.Equal(TimeSpan.FromSeconds(2), options.PullWait);
+            Assert.Equal(TimeSpan.FromMinutes(10), options.RepublishInterval);
             Assert.Equal(8L * 1024 * 1024, options.BlockCacheCapacity);
             Assert.Equal(LogLevel.Debug, options.LogLevel);
             var node = options.CreateNodeOptions(NullLogger.Instance);
@@ -112,6 +116,7 @@ namespace MajDHTProvider.Tests
             Assert.Equal(DHTTransport.Tcp, node.PreferredTransport);
             Assert.Equal(100, node.MaxRecords);
             Assert.Equal(1000, node.MaxLocalLeaves);
+            Assert.Equal(TimeSpan.FromMinutes(10), node.RepublishInterval);
         }
 
         /// <summary>Returns null for every help spelling.</summary>
@@ -146,6 +151,7 @@ namespace MajDHTProvider.Tests
         [InlineData("bootstrap --data x --cache-mb 8")]
         [InlineData("bootstrap --data x --quiet-period 1s")]
         [InlineData("bootstrap --data x --record-lifetime 1h")]
+        [InlineData("bootstrap --data x --republish-interval 10m")]
         [InlineData("bootstrap --data x --publisher " + PublisherId)]
         [InlineData("publisher --root x --tcp-port none --udp-port none")]
         [InlineData("publisher --root x --tcp-port 70000")]
@@ -157,6 +163,8 @@ namespace MajDHTProvider.Tests
         [InlineData("publisher --root x --parallelism 0")]
         [InlineData("publisher --root x --parallelism 65")]
         [InlineData("publisher --root x --record-lifetime 8d")]
+        [InlineData("publisher --root x --republish-interval 500ms")]
+        [InlineData("publisher --root x --republish-interval 46m")]
         [InlineData("publisher --root x --log-level verbose")]
         [InlineData("publisher --root x --relay")]
         [InlineData("publisher --root x --advertise 203.0.113.7")]
