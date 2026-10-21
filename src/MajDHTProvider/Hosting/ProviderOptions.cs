@@ -70,6 +70,12 @@ namespace MajDHTProvider.Hosting
         /// <summary>Gets or sets how long a publication stays valid; the publisher renews it at half its lifetime.</summary>
         public TimeSpan RecordLifetime { get; set; } = TimeSpan.FromHours(24);
 
+        /// <summary>
+        /// Gets or sets how long after a served record last reached a replica the node announces it again, from one second to
+        /// 45 minutes. Reannouncements renew the provider claims and wait while publications are replicating.
+        /// </summary>
+        public TimeSpan RepublishInterval { get; set; } = TimeSpan.FromMinutes(30);
+
         /// <summary>Gets or sets how often a replica rechecks its resources for withdrawals and updates.</summary>
         public TimeSpan RefreshInterval { get; set; } = TimeSpan.FromMinutes(10);
 
@@ -139,6 +145,7 @@ namespace MajDHTProvider.Hosting
                 Capabilities = capabilities,
                 IdentityWorkBits = IdentityWorkBits,
                 RecordLifetime = RecordLifetime,
+                RepublishInterval = RepublishInterval,
                 MaxRecords = MaxRecords,
                 MaxLocalLeaves = MaxLocalLeaves,
                 Logger = logger
